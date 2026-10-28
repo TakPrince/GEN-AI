@@ -15,6 +15,7 @@ class Direction(str, Enum):
 
 class SafetyVerdict(str, Enum):
     PASS = "pass"
+    AMBIGUOUS = "ambiguous"
     REDACT = "redact"
     BLOCK = "block"
     ERROR = "error"
