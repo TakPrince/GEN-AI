@@ -109,6 +109,25 @@ class SqliteTelemetrySink:
             finally:
                 connection.close()
 
+    def start(
+        self,
+        bus: AsyncTelemetryBus,
+        *,
+        stop: asyncio.Event | None = None,
+    ) -> asyncio.Task[int]:
+        return asyncio.create_task(self.consume(bus, stop=stop))
+
+    async def consume(
+        self,
+        bus: AsyncTelemetryBus,
+        *,
+        stop: asyncio.Event | None = None,
+    ) -> int:
+        total = 0
+        while stop is None or not stop.is_set():
+            total += await self.drain_batch(bus)
+        return total
+
     async def drain_batch(
         self,
         bus: AsyncTelemetryBus,

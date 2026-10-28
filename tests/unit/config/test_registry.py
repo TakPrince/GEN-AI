@@ -7,6 +7,7 @@ from safety_platform.config.registry import (
     Direction,
     DirectionProfile,
     ExecutionContext,
+    LatencyBudget,
     Route,
     RouteVerdict,
     RoutingMargins,
@@ -145,3 +146,19 @@ def test_telemetry_event_rejects_invalid_spans() -> None:
 def test_execution_context_requires_identifiers() -> None:
     with pytest.raises(ValueError, match="trace_id"):
         ExecutionContext("", "turn", "conversation")
+
+
+def test_latency_budget_defaults_are_centralized() -> None:
+    budget = direction_profile().budgets
+
+    assert isinstance(budget, LatencyBudget)
+    assert budget.tier1_ms == 60.0
+    assert budget.tier2_ms == 20.0
+    assert budget.cascade_ms == 400.0
+
+
+def test_latency_budget_rejects_invalid_values() -> None:
+    with pytest.raises(ValueError, match="tier2_ms"):
+        LatencyBudget(tier2_ms=0.0)
+    with pytest.raises(ValueError, match="headroom"):
+        LatencyBudget(tier1_ms=300.0, tier2_ms=100.0)

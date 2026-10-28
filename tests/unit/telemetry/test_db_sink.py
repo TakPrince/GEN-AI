@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -92,3 +93,28 @@ def test_invalid_configuration_is_rejected(tmp_path: Path) -> None:
         SqliteTelemetrySink(tmp_path / "events.sqlite3", batch_size=0)
     with pytest.raises(ValueError, match="max_batch_wait_ms"):
         SqliteTelemetrySink(tmp_path / "events.sqlite3", max_batch_wait_ms=-1)
+
+
+@pytest.mark.asyncio
+async def test_background_consumer_writes_until_stopped(tmp_path: Path) -> None:
+    database = tmp_path / "events.sqlite3"
+    sink = SqliteTelemetrySink(
+        database,
+        max_batch_wait_ms=0,
+    )
+    bus = AsyncTelemetryBus()
+    stop = asyncio.Event()
+    task = sink.start(bus, stop=stop)
+    await asyncio.sleep(0)
+    assert bus.emit_nowait(event(3))
+    stop.set()
+
+    written = await asyncio.wait_for(task, timeout=1.0)
+
+    assert written == 1
+    with closing(sqlite3.connect(database)) as connection:
+        row = connection.execute(
+            "SELECT event_id FROM stage_event"
+        ).fetchone()
+
+    assert row == ("3",)

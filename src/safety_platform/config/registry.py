@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
 from typing import Mapping
@@ -119,10 +119,35 @@ class RoutingMargins:
 
 
 @dataclass(frozen=True, slots=True)
+class LatencyBudget:
+    """Centralized p95 latency ceilings for the guardrail path."""
+
+    tier1_ms: float = 60.0
+    tier2_ms: float = 20.0
+    cascade_ms: float = 400.0
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.tier1_ms, "tier1_ms"),
+            (self.tier2_ms, "tier2_ms"),
+            (self.cascade_ms, "cascade_ms"),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not 0.0 < float(value)
+            ):
+                raise ValueError(f"{name} must be a positive number")
+        if self.tier1_ms + self.tier2_ms >= self.cascade_ms:
+            raise ValueError("tier budgets must leave cascade headroom")
+
+
+@dataclass(frozen=True, slots=True)
 class DirectionProfile:
     thresholds: CascadeThresholds
     gates: TierGates
     margins: RoutingMargins
+    budgets: LatencyBudget = field(default_factory=LatencyBudget)
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +271,7 @@ __all__ = [
     "Direction",
     "DirectionProfile",
     "ExecutionContext",
+    "LatencyBudget",
     "Route",
     "RouteVerdict",
     "RoutingMargins",
