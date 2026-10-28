@@ -117,3 +117,15 @@ def test_middleware_rejects_wrong_budget_type() -> None:
             AsyncTelemetryBus(),
             budget=cast(LatencyBudget, "20ms"),
         )
+
+
+@pytest.mark.asyncio
+async def test_middleware_handles_non_string_prompt_hash_fallback() -> None:
+    bus = AsyncTelemetryBus()
+    middleware = VectorFilterMiddleware(detector((1.0, 0.0)), bus)
+
+    result = await middleware(cast(str, 1), context())
+    event = await bus.receive()
+
+    assert result.verdict is SafetyVerdict.ERROR
+    assert len(event.prompt_hash) == 64

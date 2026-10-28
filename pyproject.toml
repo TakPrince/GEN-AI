@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=80", "wheel>=0.45"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "safety-platform"
+version = "0.1.0"
+description = "Local-first multi-turn LLM red-teaming and three-tier guardrail platform."
+readme = "Readme.md"
+requires-python = ">=3.13"
+keywords = ["guardrails", "llm", "red-teaming", "safety", "telemetry"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "black>=25.9,<26",
+    "mypy>=1.17,<2",
+    "pytest>=8.4,<9",
+    "pytest-asyncio>=1.4,<2",
+    "pytest-cov>=7.1,<8",
+    "ruff>=0.12,<0.13",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["safety_platform*"]
+
+[tool.black]
+line-length = 88
+target-version = ["py313"]
+preview = false
+extend-exclude = '''
+/(
+    \.git
+  | \.mypy_cache
+  | \.pytest_cache
+  | \.ruff_cache
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+src = ["src", "tests"]
+preview = false
+fix = false
+show-fixes = true
+extend-exclude = [".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "build", "dist"]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "W",
+    "I",
+    "B",
+    "C4",
+    "UP",
+    "SIM",
+    "RUF",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["safety_platform"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+docstring-code-format = true

@@ -69,9 +69,7 @@ class ResponseRouter:
         )
 
         errors = tuple(
-            decision
-            for decision in ordered
-            if decision.verdict is SafetyVerdict.ERROR
+            decision for decision in ordered if decision.verdict is SafetyVerdict.ERROR
         )
         if errors:
             chosen = errors[-1]
@@ -83,9 +81,7 @@ class ResponseRouter:
             )
 
         blocks = tuple(
-            decision
-            for decision in ordered
-            if decision.verdict is SafetyVerdict.BLOCK
+            decision for decision in ordered if decision.verdict is SafetyVerdict.BLOCK
         )
         if blocks:
             return RouteVerdict(
@@ -110,9 +106,7 @@ class ResponseRouter:
             )
 
         redactions = tuple(
-            decision
-            for decision in ordered
-            if decision.verdict is SafetyVerdict.REDACT
+            decision for decision in ordered if decision.verdict is SafetyVerdict.REDACT
         )
         if redactions:
             chosen = redactions[-1]

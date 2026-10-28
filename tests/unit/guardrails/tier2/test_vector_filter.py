@@ -1,3 +1,4 @@
+import math
 from collections.abc import Sequence
 from typing import cast
 
@@ -11,6 +12,7 @@ from safety_platform.config.registry import (
 from safety_platform.guardrails.tier2.vector_filter import (
     Centroid,
     VectorFilter,
+    VectorFilterResult,
 )
 
 
@@ -163,3 +165,39 @@ def test_non_string_input_is_rejected() -> None:
             thresholds(),
             margins(),
         ).evaluate(cast(str, 1))
+
+
+def test_centroid_validation_rejects_bad_vectors() -> None:
+    with pytest.raises(ValueError, match="centroid_id"):
+        Centroid("", (1.0, 0.0))
+    with pytest.raises(ValueError, match="numeric"):
+        Centroid("attack", cast(tuple[float, ...], ("bad",)))
+    with pytest.raises(ValueError, match="empty"):
+        Centroid("attack", ())
+    with pytest.raises(ValueError, match="finite"):
+        Centroid("attack", (math.inf,))
+    with pytest.raises(ValueError, match="magnitude"):
+        Centroid("attack", (0.0, 0.0))
+
+
+def test_vector_result_validation() -> None:
+    with pytest.raises(TypeError, match="verdict"):
+        VectorFilterResult(cast(SafetyVerdict, "pass"))
+    with pytest.raises(ValueError, match="requires error"):
+        VectorFilterResult(SafetyVerdict.ERROR)
+    with pytest.raises(ValueError, match="only valid for error"):
+        VectorFilterResult(SafetyVerdict.PASS, error="unexpected")
+    with pytest.raises(ValueError, match="finite"):
+        VectorFilterResult(SafetyVerdict.PASS, top_similarity=math.nan)
+    assert VectorFilterResult(SafetyVerdict.BLOCK).blocked is True
+    assert VectorFilterResult(SafetyVerdict.PASS).blocked is False
+
+
+def test_filter_rejects_non_centroid_values() -> None:
+    with pytest.raises(TypeError, match="Centroid"):
+        VectorFilter(
+            StubEmbedder((1.0, 0.0)),
+            (cast(Centroid, object()),),
+            thresholds(),
+            margins(),
+        )

@@ -113,8 +113,6 @@ async def test_background_consumer_writes_until_stopped(tmp_path: Path) -> None:
 
     assert written == 1
     with closing(sqlite3.connect(database)) as connection:
-        row = connection.execute(
-            "SELECT event_id FROM stage_event"
-        ).fetchone()
+        row = connection.execute("SELECT event_id FROM stage_event").fetchone()
 
     assert row == ("3",)

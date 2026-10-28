@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Mapping
 
 
 class Direction(str, Enum):
@@ -57,7 +57,7 @@ def _text(value: str, name: str) -> None:
 
 
 def _unit(value: float, name: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         raise ValueError(f"{name} must be numeric")
     if not 0.0 <= float(value) <= 1.0:
         raise ValueError(f"{name} must be within [0, 1]")
@@ -134,8 +134,8 @@ class LatencyBudget:
         ):
             if (
                 isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not 0.0 < float(value)
+                or not isinstance(value, int | float)
+                or float(value) <= 0.0
             ):
                 raise ValueError(f"{name} must be a positive number")
         if self.tier1_ms + self.tier2_ms >= self.cascade_ms:

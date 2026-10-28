@@ -1,4 +1,5 @@
 from dataclasses import FrozenInstanceError
+from typing import Any, cast
 
 import pytest
 
@@ -43,7 +44,7 @@ def test_profile_selects_direction_and_is_frozen() -> None:
     assert current.for_direction(Direction.INPUT) is current.input
     assert current.for_direction(Direction.OUTPUT) is current.output
     with pytest.raises(FrozenInstanceError):
-        setattr(current, "version", "v2")
+        cast(Any, current).version = "v2"
 
 
 def test_ambiguity_floor_must_be_below_block_threshold() -> None:

@@ -29,9 +29,7 @@ def centroid(index: int) -> Centroid:
 
 
 def query_vector() -> tuple[float, ...]:
-    return tuple(
-        math.cos((dimension + 1) * 0.023) for dimension in range(64)
-    )
+    return tuple(math.cos((dimension + 1) * 0.023) for dimension in range(64))
 
 
 def test_tier2_vector_filter_p95_under_20ms() -> None:

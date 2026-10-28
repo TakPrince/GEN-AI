@@ -72,15 +72,11 @@ class Tier3Classifier:
         except Exception as exc:
             return Tier3Result(SafetyVerdict.ERROR, error=type(exc).__name__)
 
-        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-            return Tier3Result(
-                SafetyVerdict.ERROR, error="invalid_confidence"
-            )
+        if isinstance(raw, bool) or not isinstance(raw, int | float):
+            return Tier3Result(SafetyVerdict.ERROR, error="invalid_confidence")
         confidence = float(raw)
         if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
-            return Tier3Result(
-                SafetyVerdict.ERROR, error="invalid_confidence"
-            )
+            return Tier3Result(SafetyVerdict.ERROR, error="invalid_confidence")
 
         verdict = (
             SafetyVerdict.BLOCK

@@ -106,9 +106,7 @@ class VectorFilter:
         try:
             embedding = _unit_vector(self._embedder.embed(text))
         except Exception as exc:
-            return VectorFilterResult(
-                SafetyVerdict.ERROR, error=type(exc).__name__
-            )
+            return VectorFilterResult(SafetyVerdict.ERROR, error=type(exc).__name__)
         if len(embedding) != self._dimension:
             return VectorFilterResult(
                 SafetyVerdict.ERROR, error="embedding_dimension_mismatch"

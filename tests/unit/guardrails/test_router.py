@@ -1,3 +1,5 @@
+from typing import cast
+
 import pytest
 
 from safety_platform.config.registry import (
@@ -180,3 +182,20 @@ def test_stage_decision_rejects_invalid_payloads() -> None:
             SafetyVerdict.BLOCK,
             reason_codes=("",),
         )
+
+
+def test_stage_decision_rejects_wrong_field_types() -> None:
+    with pytest.raises(TypeError, match="stage"):
+        StageDecision(cast(Stage, "tier1"), SafetyVerdict.PASS)
+    with pytest.raises(TypeError, match="verdict"):
+        StageDecision(Stage.TIER1, cast(SafetyVerdict, "pass"))
+
+
+def test_stage_decision_rejects_error_on_non_error_verdict() -> None:
+    with pytest.raises(ValueError, match="only valid for error"):
+        StageDecision(Stage.TIER1, SafetyVerdict.PASS, error="unexpected")
+
+
+def test_router_rejects_non_context() -> None:
+    with pytest.raises(TypeError, match="context"):
+        ResponseRouter().route(cast(ExecutionContext, "context"), ())
