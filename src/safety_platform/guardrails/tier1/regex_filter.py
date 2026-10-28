@@ -5,14 +5,10 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, Pattern
 
+from ...config.registry import SafetyVerdict
+
 MAX_INPUT_BYTES = 4096
-
-
-class RegexVerdict(str, Enum):
-    PASS = "pass"
-    BLOCK = "block"
-    REDACT = "redact"
-    ERROR = "error"
+RegexVerdict = SafetyVerdict
 
 
 class RegexAction(str, Enum):

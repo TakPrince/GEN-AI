@@ -2,8 +2,13 @@ import time
 
 import pytest
 
-from safety_platform.guardrails.tier1.regex_filter import RegexAction, RegexFilter, RegexRule
-from safety_platform.middleware.regex_filter import FilterContext, RegexFilterMiddleware
+from safety_platform.config.registry import ExecutionContext
+from safety_platform.guardrails.tier1.regex_filter import (
+    RegexAction,
+    RegexFilter,
+    RegexRule,
+)
+from safety_platform.middleware.regex_filter import RegexFilterMiddleware
 from safety_platform.telemetry import AsyncTelemetryBus
 
 
@@ -24,7 +29,7 @@ async def test_tier1_regex_middleware_p95_under_60ms() -> None:
     ]
     bus = AsyncTelemetryBus()
     middleware = RegexFilterMiddleware(RegexFilter(rules), bus)
-    context = FilterContext("trace", "turn", "conversation")
+    context = ExecutionContext("trace", "turn", "conversation")
     text = ("benign local prompt " * 300)[:4096]
 
     for _ in range(25):

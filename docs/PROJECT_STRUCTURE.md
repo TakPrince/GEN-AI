@@ -455,8 +455,8 @@ The local Llama-Guard-class classifier client, policy-specific semantic filters,
 | `cascade.py` | Tier order, short-circuit rules, verdict aggregation, and per-stage latency capture. |
 | `router.py` | The learned minimum-sufficient-defense decision for whether Tier 3 is invoked. |
 | `response_router.py` | Final routing to `safe`, `refuse`, or `redact`, with the canned refusal fallback. |
-| `verdicts.py` | Shared verdict enums and value objects used by API, telemetry, and evaluation. |
-| `thresholds.py` | Loading and validation of the active guardrail version's threshold set. |
+| `verdicts.py` | Guardrail aggregation helpers; shared verdict vocabulary lives in `config/registry.py`. |
+| `thresholds.py` | Loading and validation of the active versioned `SafetyProfile`; schema ownership lives in `config/registry.py`. |
 
 ---
 
@@ -564,11 +564,11 @@ Report rendering and trend tables keyed by guardrail version, dataset, and metri
 
 ### `src/safety_platform/schemas/`
 
-Pydantic request, response, event, verdict, and pagination contracts live here. They are the shared language between the HTTP layer, telemetry bus, persistence adapters, and evaluation jobs.
+Pydantic HTTP request, response, and pagination contracts live here. Internal execution, routing, and telemetry contracts are canonical in `config/registry.py`; this package owns their wire representations.
 
 ### `src/safety_platform/config/`
 
-Typed runtime settings and their loaders live here, sourced from environment variables and checked at startup. This is the boundary between deploy-time configuration and code, distinct from the declarative guardrail content in top-level `configs/`.
+Typed runtime settings and their loaders live here, sourced from environment variables and checked at startup. `config/registry.py` is the canonical immutable safety profile and cross-layer contract vocabulary; declarative guardrail content remains in top-level `configs/`.
 
 ### `src/safety_platform/core/`
 
@@ -647,11 +647,11 @@ Small, deterministic, committed datasets for unit, contract, and golden tests li
 | Layer | May depend on | Must not depend on |
 |---|---|---|
 | `api` | `schemas`, `guardrails`, `orchestrator`, `telemetry`, `db.repositories`, `config`, `core` | `db.models`, provider SDKs |
-| `middleware` | `guardrails.cascade`, `guardrails.verdicts`, `schemas`, `telemetry`, `core` | `db`, `api.v1` |
+| `middleware` | `guardrails.cascade`, `guardrails.verdicts`, `config.registry`, `schemas`, `telemetry`, `core` | `db`, `api.v1` |
 | `guardrails` | `inference`, `telemetry.emitters`, `schemas`, `config`, `core` | `api`, `db`, `orchestrator` |
 | `orchestrator` | `schemas`, `db.repositories`, an HTTP client to the execution API | guardrail tier internals |
 | `inference` | `config`, `core` | `guardrails`, `api`, `db` |
-| `telemetry` | `schemas.events`, `core` | `db`, `guardrails` |
+| `telemetry` | `config.registry`, `core` | `db`, `guardrails` |
 | `db` | `core`, `schemas` in repositories only | `api`, `guardrails`, `telemetry` |
 | `evaluation` | `db.repositories`, `datasets`, `schemas`, `guardrails`, `inference` | `api.v1` handlers or the request path |
 | `core` | Standard library and small primitives | any application package |

@@ -4,24 +4,18 @@ import hashlib
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
 
-from ..guardrails.tier1.regex_filter import (
-    RegexFilter,
-    RegexFilterResult,
-    RegexVerdict,
+from ..config.registry import (
+    ExecutionContext,
+    SafetyVerdict,
+    Stage,
+    TelemetryEvent,
+    TelemetryLane,
 )
-from ..telemetry.events import StageEvent, TelemetrySink
+from ..guardrails.tier1.regex_filter import RegexFilter, RegexFilterResult
+from ..telemetry.events import TelemetrySink
 
-STAGE = "tier1.regex"
-
-
-@dataclass(frozen=True, slots=True)
-class FilterContext:
-    trace_id: str
-    turn_id: str
-    conversation_id: str
-    direction: str = "input"
+FilterContext = ExecutionContext
 
 
 class RegexFilterMiddleware:
@@ -40,7 +34,7 @@ class RegexFilterMiddleware:
     async def __call__(
         self,
         text: str,
-        context: FilterContext,
+        context: ExecutionContext,
     ) -> RegexFilterResult:
         started = self._clock()
         error: str | None = None
@@ -49,22 +43,20 @@ class RegexFilterMiddleware:
         except Exception as exc:
             error = type(exc).__name__
             result = RegexFilterResult(
-                verdict=RegexVerdict.ERROR,
+                verdict=SafetyVerdict.ERROR,
                 error=error,
             )
 
         latency_ms = max(0.0, (self._clock() - started) / 1_000_000)
-        event = StageEvent(
+        event = TelemetryEvent(
             event_id=uuid.uuid4().hex,
-            trace_id=context.trace_id,
-            turn_id=context.turn_id,
-            conversation_id=context.conversation_id,
-            stage=STAGE,
-            direction=context.direction,
-            verdict=result.verdict.value,
+            context=context,
+            stage=Stage.TIER1,
+            verdict=result.verdict,
             latency_ms=latency_ms,
             prompt_hash=_prompt_hash(text),
             timestamp_ns=time.time_ns(),
+            lane=TelemetryLane.DECISION,
             rule_ids=result.rule_ids,
             redaction_spans=result.redaction_spans,
             error=error,

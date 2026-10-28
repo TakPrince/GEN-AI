@@ -1,21 +1,25 @@
 import pytest
 
+from safety_platform.config.registry import (
+    ExecutionContext,
+    SafetyVerdict,
+    Stage,
+    TelemetryEvent,
+    TelemetryLane,
+)
 from safety_platform.telemetry import AsyncTelemetryBus
-from safety_platform.telemetry.events import StageEvent
 
 
-def event(index: int) -> StageEvent:
-    return StageEvent(
+def event(index: int) -> TelemetryEvent:
+    return TelemetryEvent(
         event_id=str(index),
-        trace_id="trace",
-        turn_id="turn",
-        conversation_id="conversation",
-        stage="tier1.regex",
-        direction="input",
-        verdict="pass",
+        context=ExecutionContext("trace", "turn", "conversation"),
+        stage=Stage.TIER1,
+        verdict=SafetyVerdict.PASS,
         latency_ms=0.1,
         prompt_hash="hash",
         timestamp_ns=index,
+        lane=TelemetryLane.DECISION,
     )
 
 

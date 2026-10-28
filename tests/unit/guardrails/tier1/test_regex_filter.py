@@ -1,4 +1,5 @@
 import re
+from typing import cast
 
 import pytest
 
@@ -90,7 +91,7 @@ def test_duplicate_rule_id_rejected() -> None:
 
 def test_invalid_action_rejected() -> None:
     with pytest.raises(RegexConfigurationError, match="action"):
-        RegexFilter([RegexRule("bad", r"a", "warn")])
+        RegexFilter([RegexRule("bad", r"a", cast(RegexAction, "warn"))])
 
 
 def test_invalid_regex_rejected() -> None:
@@ -130,7 +131,7 @@ def test_non_string_rejected() -> None:
     detector = RegexFilter([])
 
     with pytest.raises(TypeError):
-        detector.evaluate(1)
+        detector.evaluate(cast(str, 1))
 
 
 def test_flags_are_honored() -> None:

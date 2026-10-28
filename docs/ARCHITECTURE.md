@@ -1,6 +1,6 @@
 # Architecture: Local-First Multi-Turn LLM Red-Teaming
 
-**Status:** Proposed. No application code.
+**Status:** Proposed. Initial Tier 1 scaffold implemented.
 
 **Scope:** Single-host research system: adaptive attacks, symmetric defense, best-effort telemetry, local evaluation. Not a production security boundary.
 
