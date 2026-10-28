@@ -1,0 +1,21 @@
+{
+  "attack_source": "judge_comparison:test",
+  "benign_source": "behaviors:benign",
+  "counts": {
+    "attack": {
+      "test": 30,
+      "train": 10
+    },
+    "benign": {
+      "test": 30,
+      "train": 10
+    }
+  },
+  "dataset": "JailbreakBench/JBB-Behaviors",
+  "dataset_url": "https://huggingface.co/datasets/JailbreakBench/JBB-Behaviors",
+  "digest": "8bde5da5f8f345b3a837be5bfe9cbb3d30c384058bd3d26831b0a9a0e7879b5a",
+  "source_split_size": {
+    "attack": 300,
+    "benign": 100
+  }
+}

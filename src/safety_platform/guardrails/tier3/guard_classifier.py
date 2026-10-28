@@ -75,7 +75,8 @@ class UrllibOllamaTransport:
                 "model": request.model,
                 "prompt": request.prompt,
                 "stream": False,
-                "options": {"temperature": 0},
+                "think": False,
+                "options": {"temperature": 0, "num_predict": 8},
             }
         ).encode("utf-8")
         url = f"{request.base_url.rstrip('/')}/api/generate"

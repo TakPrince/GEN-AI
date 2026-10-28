@@ -27,11 +27,13 @@ dev = [
     "pytest-asyncio>=1.4,<2",
     "pytest-cov>=7.1,<8",
     "ruff>=0.12,<0.13",
+    "streamlit>=1.51,<2",
 ]
+ui = ["streamlit>=1.51,<2"]
 
 [tool.setuptools.packages.find]
-where = ["src"]
-include = ["safety_platform*"]
+where = ["src", "."]
+include = ["safety_platform*", "metrics*"]
 
 [tool.black]
 line-length = 88
@@ -52,7 +54,7 @@ extend-exclude = '''
 [tool.ruff]
 target-version = "py313"
 line-length = 88
-src = ["src", "tests"]
+src = ["src", "metrics", "tests"]
 preview = false
 fix = false
 show-fixes = true
@@ -72,7 +74,7 @@ select = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["safety_platform"]
+known-first-party = ["metrics", "safety_platform"]
 
 [tool.ruff.format]
 quote-style = "double"
