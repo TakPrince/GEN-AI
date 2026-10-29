@@ -35,6 +35,7 @@ def main() -> None:
         type=Path,
         default=Path("evaluation/results/jbb-v1.sqlite3"),
     )
+    run.add_argument("--reuse-run", metavar="RUN_ID")
     run.add_argument("--target", default="llama3.2:latest")
     run.add_argument("--embed", default="llama3.2:latest")
     run.add_argument("--tier3", default="qwen3:8b")
@@ -68,6 +69,7 @@ def main() -> None:
         config = RunConfig(
             dataset_path=arguments.dataset,
             database_path=arguments.db,
+            reuse_run_id=arguments.reuse_run,
             target_model=arguments.target,
             embed_model=arguments.embed,
             tier3_model=arguments.tier3,

@@ -139,3 +139,18 @@ def test_embedder_batches_large_requests() -> None:
     embedder.embed_many(tuple(f"text-{index}" for index in range(20)))
 
     assert [len(batch) for batch in client.calls] == [16, 4]
+
+
+def test_embedder_snapshot_and_seed() -> None:
+    client = EmbedClient()
+    embedder = OllamaEmbedder(client)
+
+    embedder.seed((("cached", (1.5, 2.5)),))
+    assert embedder.embed("cached") == (1.5, 2.5)
+    assert client.calls == []
+    assert embedder.snapshot() == (("cached", (1.5, 2.5)),)
+
+    with pytest.raises(TypeError, match="numeric"):
+        embedder.seed((("bad", (True,)),))
+    with pytest.raises(ValueError, match="non-empty"):
+        embedder.seed((("empty", ()),))

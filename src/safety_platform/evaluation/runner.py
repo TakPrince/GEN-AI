@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
+import struct
 import time
 import uuid
 from collections.abc import Sequence
@@ -57,6 +59,14 @@ CREATE TABLE IF NOT EXISTS run_result (
     final_response TEXT NOT NULL,
     PRIMARY KEY (run_id, case_id, system)
 );
+CREATE TABLE IF NOT EXISTS embedding_cache (
+    model TEXT NOT NULL,
+    text_sha256 TEXT NOT NULL,
+    text TEXT NOT NULL,
+    dimensions INTEGER NOT NULL,
+    embedding BLOB NOT NULL,
+    PRIMARY KEY (model, text_sha256)
+);
 """
 
 
@@ -64,6 +74,7 @@ CREATE TABLE IF NOT EXISTS run_result (
 class RunConfig:
     dataset_path: Path
     database_path: Path
+    reuse_run_id: str | None = None
     target_model: str = "llama3.2:latest"
     embed_model: str = "llama3.2:latest"
     tier3_model: str = "qwen3:8b"
@@ -104,45 +115,74 @@ async def run_evaluation(config: RunConfig) -> str:
     target = OllamaClient(config.target_model)
     judge = ComplianceJudge(OllamaClient(config.judge_model))
 
+    digest_value = dataset_digest(config.dataset_path)
     config.database_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(config.database_path, timeout=30.0)
-    connection.executescript(_SCHEMA)
     run_id = f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
     started_ns = time.time_ns()
-    connection.execute(
-        """
-        INSERT INTO run (
-            run_id, started_ns, target_model, embed_model, tier3_model,
-            judge_model, dataset_path, dataset_digest, config_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            run_id,
-            started_ns,
-            config.target_model,
-            config.embed_model,
-            config.tier3_model,
-            config.judge_model,
-            str(config.dataset_path),
-            dataset_digest(config.dataset_path),
-            json.dumps(
-                {
-                    "per_label": config.per_label,
-                    "tier2_block": config.tier2_block,
-                    "tier2_floor": config.tier2_floor,
-                    "tier2_gap": config.tier2_gap,
-                    "tier3_confidence": config.tier3_confidence,
-                },
-                sort_keys=True,
-            ),
-        ),
-    )
-    connection.commit()
-
+    inserted = False
     try:
-        await _warm_target(target, embedder)
+        connection.executescript(_SCHEMA)
+        embedder.seed(_load_embedding_cache(connection, config.embed_model))
+        reused: dict[str, tuple[_GeneratedCase, JudgeResult]] = (
+            _load_reusable_baseline(
+                connection,
+                run_id=config.reuse_run_id,
+                test_cases=test_cases,
+                target_model=config.target_model,
+                judge_model=config.judge_model,
+                digest=digest_value,
+            )
+            if config.reuse_run_id is not None
+            else {}
+        )
+        connection.execute(
+            """
+            INSERT INTO run (
+                run_id, started_ns, target_model, embed_model, tier3_model,
+                judge_model, dataset_path, dataset_digest, config_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                started_ns,
+                config.target_model,
+                config.embed_model,
+                config.tier3_model,
+                config.judge_model,
+                str(config.dataset_path),
+                digest_value,
+                json.dumps(
+                    {
+                        "per_label": config.per_label,
+                        "reuse_run_id": config.reuse_run_id,
+                        "tier2_block": config.tier2_block,
+                        "tier2_floor": config.tier2_floor,
+                        "tier2_gap": config.tier2_gap,
+                        "tier3_confidence": config.tier3_confidence,
+                    },
+                    sort_keys=True,
+                ),
+            ),
+        )
+        connection.commit()
+        inserted = True
+
+        if len(reused) < len(test_cases):
+            await _warm_target(target, embedder)
         generated: list[_GeneratedCase] = []
+        judgments: dict[str, JudgeResult] = {}
         for index, case in enumerate(test_cases, start=1):
+            cached = reused.get(case.case_id)
+            if cached is not None:
+                item, judged = cached
+                generated.append(item)
+                judgments[case.case_id] = judged
+                print(
+                    f"reuse    {index:03d}/{len(test_cases):03d} {case.case_id}",
+                    flush=True,
+                )
+                continue
             raw, generation_ms = await _generate(target, case.prompt)
             generated.append(_GeneratedCase(case, raw, generation_ms))
             print(
@@ -159,6 +199,11 @@ async def run_evaluation(config: RunConfig) -> str:
             )
         )
         await asyncio.to_thread(embedder.embed_many, texts)
+        _save_embedding_cache(
+            connection,
+            config.embed_model,
+            embedder.snapshot(),
+        )
         cascade = build_cascade(
             train_cases,
             embedder,
@@ -168,9 +213,8 @@ async def run_evaluation(config: RunConfig) -> str:
         )
         await _warm_guard(connector, judge, test_cases[0])
 
-        judgments: dict[str, JudgeResult] = {}
         for index, item in enumerate(generated, start=1):
-            if item.case.label != "attack":
+            if item.case.label != "attack" or item.case.case_id in judgments:
                 continue
             judgments[item.case.case_id] = await asyncio.to_thread(
                 judge.judge,
@@ -283,13 +327,139 @@ async def run_evaluation(config: RunConfig) -> str:
                 flush=True,
             )
     finally:
-        connection.execute(
-            "UPDATE run SET completed_ns = ? WHERE run_id = ?",
-            (time.time_ns(), run_id),
-        )
-        connection.commit()
+        if inserted:
+            connection.execute(
+                "UPDATE run SET completed_ns = ? WHERE run_id = ?",
+                (time.time_ns(), run_id),
+            )
+            connection.commit()
         connection.close()
     return run_id
+
+
+def _load_reusable_baseline(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    test_cases: Sequence[EvaluationCase],
+    target_model: str,
+    judge_model: str,
+    digest: str,
+) -> dict[str, tuple[_GeneratedCase, JudgeResult]]:
+    meta = connection.execute(
+        "SELECT target_model, judge_model, dataset_digest FROM run WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    if meta is None:
+        raise ValueError(f"unknown reuse_run_id: {run_id}")
+    if str(meta[0]) != target_model:
+        raise ValueError("reuse run target model does not match")
+    if str(meta[1]) != judge_model:
+        raise ValueError("reuse run judge model does not match")
+    if str(meta[2]) != digest:
+        raise ValueError("reuse run dataset digest does not match")
+
+    rows = connection.execute(
+        """
+        SELECT case_id, label, category, raw_response, generation_ms,
+               judge_complied, judge_error
+        FROM run_result
+        WHERE run_id = ? AND system = 'baseline'
+        """,
+        (run_id,),
+    ).fetchall()
+    by_case = {str(row[0]): row for row in rows}
+    reused: dict[str, tuple[_GeneratedCase, JudgeResult]] = {}
+    for case in test_cases:
+        row = by_case.get(case.case_id)
+        if row is None:
+            continue
+        if str(row[1]) != case.label or str(row[2]) != case.category:
+            raise ValueError(f"reuse row metadata mismatch: {case.case_id}")
+        raw = row[3]
+        generation_ms = row[4]
+        complied = row[5]
+        judge_error = row[6]
+        if not isinstance(raw, str):
+            raise ValueError(f"reuse raw response is not text: {case.case_id}")
+        if isinstance(generation_ms, bool) or not isinstance(
+            generation_ms, int | float
+        ):
+            raise ValueError(f"reuse generation time is invalid: {case.case_id}")
+        if complied not in (0, 1):
+            raise ValueError(f"reuse judge verdict is invalid: {case.case_id}")
+        if judge_error is not None and not isinstance(judge_error, str):
+            raise ValueError(f"reuse judge error is invalid: {case.case_id}")
+        reused[case.case_id] = (
+            _GeneratedCase(case, raw, float(generation_ms)),
+            JudgeResult(bool(complied), "", judge_error),
+        )
+    return reused
+
+
+def _load_embedding_cache(
+    connection: sqlite3.Connection,
+    model: str,
+) -> tuple[tuple[str, tuple[float, ...]], ...]:
+    rows = connection.execute(
+        """
+        SELECT text_sha256, text, dimensions, embedding
+        FROM embedding_cache
+        WHERE model = ?
+        """,
+        (model,),
+    ).fetchall()
+    entries: list[tuple[str, tuple[float, ...]]] = []
+    for row in rows:
+        stored_hash = row[0]
+        text = row[1]
+        dimensions = row[2]
+        blob = row[3]
+        if not isinstance(stored_hash, str) or not isinstance(text, str):
+            raise ValueError("embedding cache metadata is invalid")
+        if isinstance(dimensions, bool) or not isinstance(dimensions, int):
+            raise ValueError("embedding cache dimensions are invalid")
+        if not isinstance(blob, bytes) or len(blob) != dimensions * 8:
+            raise ValueError("embedding cache payload is invalid")
+        if stored_hash != _text_sha256(text):
+            raise ValueError("embedding cache digest does not match")
+        entries.append((text, struct.unpack(f"<{dimensions}d", blob)))
+    return tuple(entries)
+
+
+def _save_embedding_cache(
+    connection: sqlite3.Connection,
+    model: str,
+    entries: Sequence[tuple[str, tuple[float, ...]]],
+) -> None:
+    rows: list[tuple[str, str, str, int, bytes]] = []
+    for text, values in entries:
+        if not text or not values:
+            raise ValueError("embedding cache entry is invalid")
+        rows.append(
+            (
+                model,
+                _text_sha256(text),
+                text,
+                len(values),
+                struct.pack(f"<{len(values)}d", *values),
+            )
+        )
+    if not rows:
+        return
+    connection.executemany(
+        """
+        INSERT OR REPLACE INTO embedding_cache (
+            model, text_sha256, text, dimensions, embedding
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    connection.commit()
+
+
+def _text_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _select_test(

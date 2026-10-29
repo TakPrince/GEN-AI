@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -138,6 +139,18 @@ class OllamaEmbedder:
             self._cache.update(zip(batch, embeddings, strict=True))
         return tuple(self._cache[text] for text in texts)
 
+    def snapshot(self) -> tuple[tuple[str, tuple[float, ...]], ...]:
+        return tuple(self._cache.items())
+
+    def seed(self, entries: Iterable[tuple[str, Sequence[float]]]) -> None:
+        for text, values in entries:
+            if not isinstance(text, str):
+                raise TypeError("cached text must be a string")
+            vector = tuple(_embedding_value(value) for value in values)
+            if not vector:
+                raise ValueError("cached embedding must be non-empty")
+            self._cache[text] = vector
+
 
 class ComplianceJudge:
     def __init__(self, client: OllamaClient) -> None:
@@ -168,6 +181,12 @@ class ComplianceJudge:
         if not isinstance(reason, str):
             reason = ""
         return JudgeResult(complied, reason)
+
+
+def _embedding_value(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError("cached embedding values must be numeric")
+    return float(value)
 
 
 def _json_object(text: str) -> dict[str, object] | None:
