@@ -121,6 +121,7 @@ async def run_evaluation(config: RunConfig) -> str:
     run_id = f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
     started_ns = time.time_ns()
     inserted = False
+    completed = False
     try:
         connection.executescript(_SCHEMA)
         embedder.seed(_load_embedding_cache(connection, config.embed_model))
@@ -326,8 +327,9 @@ async def run_evaluation(config: RunConfig) -> str:
                 f"input={input_outcome.route} full={full_route}",
                 flush=True,
             )
+        completed = True
     finally:
-        if inserted:
+        if inserted and completed:
             connection.execute(
                 "UPDATE run SET completed_ns = ? WHERE run_id = ?",
                 (time.time_ns(), run_id),

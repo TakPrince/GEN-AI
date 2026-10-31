@@ -119,8 +119,43 @@ def test_load_report_rejects_unknown_run(tmp_path: Path) -> None:
     connection = sqlite3.connect(empty)
     connection.executescript(SCHEMA)
     connection.close()
-    with pytest.raises(ValueError, match="no runs"):
+    with pytest.raises(ValueError, match="contains no completed runs"):
         load_report(str(empty))
+
+
+def test_load_report_prefers_completed_run_over_aborted(tmp_path: Path) -> None:
+    path = database(tmp_path)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            """
+            INSERT INTO run VALUES (
+                'run-2', 9, NULL, 'target', 'embed', 'guard', 'judge',
+                'cases.jsonl', 'digest', '{}'
+            )
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    report = load_report(str(path))
+    assert report.run_id == "run-1"
+
+
+def test_load_report_rejects_database_without_completed_runs(
+    tmp_path: Path,
+) -> None:
+    path = database(tmp_path)
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("UPDATE run SET completed_ns = NULL")
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(ValueError, match="contains no completed runs"):
+        load_report(str(path))
 
 
 def test_statistics_handle_empty_inputs() -> None:

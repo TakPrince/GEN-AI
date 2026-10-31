@@ -1,8 +1,12 @@
+import asyncio
 import sqlite3
 from pathlib import Path
+from collections.abc import Sequence
+from types import SimpleNamespace
 
 import pytest
 
+import safety_platform.evaluation.runner as runner_module
 from safety_platform.evaluation.cascade import CascadeOutcome
 from safety_platform.evaluation.dataset import EvaluationCase
 from safety_platform.evaluation.llm import JudgeResult
@@ -16,6 +20,7 @@ from safety_platform.evaluation.runner import (
     _result,
     _save_embedding_cache,
     _select_test,
+    run_evaluation,
 )
 
 
@@ -269,3 +274,123 @@ def test_embedding_cache_round_trip(tmp_path: Path) -> None:
             _load_embedding_cache(connection, "embed")
     finally:
         connection.close()
+
+
+class _FakeClient:
+    def __init__(self, model: str, *, timeout_s: float = 30.0) -> None:
+        self.model = model
+
+    def generate(self, prompt: str, *, num_predict: int = 256) -> str:
+        return f"raw:{prompt}"
+
+
+class _FakeEmbedder:
+    def __init__(self, client: object) -> None:
+        self.client = client
+
+    def seed(self, entries: Sequence[object]) -> None:
+        return None
+
+    def snapshot(self) -> tuple[tuple[str, tuple[float, ...]], ...]:
+        return ()
+
+    def embed(self, text: str) -> tuple[float, ...]:
+        return (1.0,)
+
+    def embed_many(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
+        return ()
+
+
+class _FakeConnector:
+    def __init__(self, config: object) -> None:
+        self.config = config
+
+    async def score(self, text: str, context: object) -> object:
+        return SimpleNamespace(verdict="safe", reason_codes=(), error=None)
+
+
+class _FakeJudge:
+    def __init__(self, client: object) -> None:
+        self.client = client
+
+    def judge(self, prompt: str, response: str) -> JudgeResult:
+        return JudgeResult(False, "")
+
+
+class _StubCascade:
+    async def run(self, text: str, context: object) -> CascadeOutcome:
+        return CascadeOutcome("refused", "block", "tier1", 2.0, False, 0.0)
+
+
+def _configure_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    build_cascade: object,
+) -> RunConfig:
+    dataset = tmp_path / "cases.jsonl"
+    dataset.write_text("[]", encoding="utf-8")
+    training = case("a1", "attack", "train")
+    test_attacks = (case(f"a{i}", "attack") for i in range(2, 4))
+    test_benign = (case(f"b{i}", "benign") for i in range(1, 3))
+    cases = (training, *test_attacks, *test_benign)
+    monkeypatch.setattr(runner_module, "load_cases", lambda _path: cases)
+    monkeypatch.setattr(runner_module, "OllamaClient", _FakeClient)
+    monkeypatch.setattr(runner_module, "OllamaEmbedder", _FakeEmbedder)
+    monkeypatch.setattr(runner_module, "OllamaLlamaGuardConnector", _FakeConnector)
+    monkeypatch.setattr(runner_module, "ComplianceJudge", _FakeJudge)
+    monkeypatch.setattr(runner_module, "build_cascade", build_cascade)
+    return RunConfig(
+        dataset_path=dataset,
+        database_path=tmp_path / "results.sqlite3",
+        per_label=1,
+    )
+
+
+def test_aborted_run_is_not_marked_completed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("boom")
+
+    config = _configure_runner(monkeypatch, tmp_path, build_cascade=boom)
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(run_evaluation(config))
+
+    connection = sqlite3.connect(config.database_path)
+    try:
+        row = connection.execute("SELECT run_id, completed_ns FROM run").fetchone()
+    finally:
+        connection.close()
+
+    assert row is not None
+    assert row[0]
+    assert row[1] is None
+
+
+def test_completed_run_marks_run_and_stores_all_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _configure_runner(
+        monkeypatch,
+        tmp_path,
+        build_cascade=lambda *args, **kwargs: _StubCascade(),
+    )
+    run_id = asyncio.run(run_evaluation(config))
+
+    connection = sqlite3.connect(config.database_path)
+    try:
+        row = connection.execute(
+            "SELECT completed_ns FROM run WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        rows = connection.execute(
+            "SELECT COUNT(*) FROM run_result WHERE run_id = ?", (run_id,)
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert row is not None and row[0] is not None
+    assert rows is not None and rows[0] == 6

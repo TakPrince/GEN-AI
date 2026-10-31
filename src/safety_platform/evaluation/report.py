@@ -127,10 +127,15 @@ def _resolve_run(connection: sqlite3.Connection, run_id: str | None) -> str:
     if run_id is not None:
         return run_id
     row = connection.execute(
-        "SELECT run_id FROM run ORDER BY completed_ns DESC LIMIT 1"
+        """
+        SELECT run_id FROM run
+        WHERE completed_ns IS NOT NULL
+        ORDER BY completed_ns DESC
+        LIMIT 1
+        """
     ).fetchone()
     if row is None:
-        raise ValueError("evaluation database contains no runs")
+        raise ValueError("evaluation database contains no completed runs")
     return str(row[0])
 
 
