@@ -14,7 +14,7 @@ import streamlit as st
 
 from metrics.db_adapter import default_database_path, load_metrics
 from safety_platform.config.registry import (
-    CascadeThresholds,
+    DEFAULT_CASCADE_THRESHOLDS,
     ExecutionContext,
     RoutingMargins,
     SafetyVerdict,
@@ -43,7 +43,7 @@ from safety_platform.research.ml_router import (
 from safety_platform.telemetry.db_sink import SqliteTelemetrySink
 
 _TOKEN = re.compile(r"[a-z0-9_'-]+")
-_THRESHOLDS = CascadeThresholds(0.80, 0.30, 0.78)
+_THRESHOLDS = DEFAULT_CASCADE_THRESHOLDS
 _MARGINS = RoutingMargins(0.01, 0.55)
 _RISK_PHRASES = (
     "ignore previous",

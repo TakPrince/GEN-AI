@@ -85,6 +85,13 @@ class CascadeThresholds:
         return (self.tier2_ambiguity_floor, self.tier2_block_similarity)
 
 
+DEFAULT_CASCADE_THRESHOLDS = CascadeThresholds(
+    tier2_block_similarity=0.80,
+    tier2_ambiguity_floor=0.45,
+    tier3_block_confidence=0.78,
+)
+
+
 @dataclass(frozen=True, slots=True)
 class TierGates:
     """Activation and short-circuit rules for one cascade direction."""
@@ -271,6 +278,7 @@ class TelemetryEvent:
 
 __all__ = [
     "CascadeThresholds",
+    "DEFAULT_CASCADE_THRESHOLDS",
     "Direction",
     "DirectionProfile",
     "ExecutionContext",

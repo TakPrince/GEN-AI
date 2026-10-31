@@ -80,6 +80,7 @@ def fetch_jbb_dataset(
     *,
     train_per_label: int = 10,
     test_per_label: int = 30,
+    overwrite: bool = False,
 ) -> Path:
     if train_per_label <= 0 or test_per_label <= 0:
         raise ValueError("split sizes must be positive")
@@ -87,12 +88,18 @@ def fetch_jbb_dataset(
     if required > 100:
         raise ValueError("JailbreakBench provides only 100 rows per label")
 
-    jailbreaks = _fetch_rows("judge_comparison", "test", 300)
-    benign = _fetch_rows("behaviors", "benign", 100)
     root = Path(destination)
-    root.mkdir(parents=True, exist_ok=True)
     cases_path = root / "cases.jsonl"
     manifest_path = root / "manifest.json"
+    if not overwrite and (cases_path.exists() or manifest_path.exists()):
+        raise ValueError(
+            "refusing to overwrite frozen dataset artifacts; "
+            "pass overwrite=True or --force to refetch"
+        )
+
+    jailbreaks = _fetch_rows("judge_comparison", "test", 300)
+    benign = _fetch_rows("behaviors", "benign", 100)
+    root.mkdir(parents=True, exist_ok=True)
 
     lines: list[str] = []
     counters: dict[str, int] = {"attack": 0, "benign": 0}

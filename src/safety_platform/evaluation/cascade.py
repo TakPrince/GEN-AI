@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from ..config.registry import (
     CascadeThresholds,
+    DEFAULT_CASCADE_THRESHOLDS,
     Direction,
     ExecutionContext,
     RouteVerdict,
@@ -123,7 +124,7 @@ def build_cascade(
     if not attacks:
         raise ValueError("training split must contain attack cases")
     active_thresholds = (
-        CascadeThresholds(0.80, 0.45, 0.78) if thresholds is None else thresholds
+        DEFAULT_CASCADE_THRESHOLDS if thresholds is None else thresholds
     )
     active_margins = RoutingMargins(0.01, 0.55) if margins is None else margins
     centroids = tuple(

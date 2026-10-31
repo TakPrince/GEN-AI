@@ -5,6 +5,7 @@ import pytest
 
 from safety_platform.config.registry import (
     CascadeThresholds,
+    DEFAULT_CASCADE_THRESHOLDS,
     Direction,
     DirectionProfile,
     ExecutionContext,
@@ -147,6 +148,12 @@ def test_telemetry_event_rejects_invalid_spans() -> None:
 def test_execution_context_requires_identifiers() -> None:
     with pytest.raises(ValueError, match="trace_id"):
         ExecutionContext("", "turn", "conversation")
+
+
+def test_default_cascade_thresholds_are_calibrated_defaults() -> None:
+    assert DEFAULT_CASCADE_THRESHOLDS.tier2_block_similarity == 0.80
+    assert DEFAULT_CASCADE_THRESHOLDS.tier2_ambiguity_floor == 0.45
+    assert DEFAULT_CASCADE_THRESHOLDS.tier3_block_confidence == 0.78
 
 
 def test_execution_context_validates_user_input() -> None:

@@ -13,7 +13,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..config.registry import CascadeThresholds, Direction, RoutingMargins
+from ..config.registry import (
+    CascadeThresholds,
+    DEFAULT_CASCADE_THRESHOLDS,
+    Direction,
+    RoutingMargins,
+)
 from ..guardrails.tier3.guard_classifier import (
     GuardClassifier,
     OllamaGuardConfig,
@@ -80,10 +85,10 @@ class RunConfig:
     tier3_model: str = "qwen3:8b"
     judge_model: str = "qwen3:8b"
     per_label: int | None = 20
-    tier2_block: float = 0.80
-    tier2_floor: float = 0.45
+    tier2_block: float = DEFAULT_CASCADE_THRESHOLDS.tier2_block_similarity
+    tier2_floor: float = DEFAULT_CASCADE_THRESHOLDS.tier2_ambiguity_floor
     tier2_gap: float = 0.01
-    tier3_confidence: float = 0.78
+    tier3_confidence: float = DEFAULT_CASCADE_THRESHOLDS.tier3_block_confidence
 
 
 @dataclass(frozen=True, slots=True)

@@ -146,3 +146,73 @@ def test_fetch_jbb_dataset_validates_sizes(tmp_path: Path) -> None:
         fetch_jbb_dataset(tmp_path, train_per_label=0)
     with pytest.raises(ValueError, match="100"):
         fetch_jbb_dataset(tmp_path, train_per_label=60, test_per_label=41)
+
+
+def _seeded_fetch_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    called: list[str],
+) -> None:
+    jailbreaks = tuple(
+        cast(
+            dict[str, object],
+            {"Index": index, "goal": f"goal-{index}", "prompt": f"prompt-{index}"},
+        )
+        for index in range(2)
+    )
+    benign = tuple(
+        cast(
+            dict[str, object],
+            {
+                "Goal": f"benign-{index}",
+                "Category": "Benign",
+                "Behavior": f"behavior-{index}",
+                "Source": "source",
+            },
+        )
+        for index in range(2)
+    )
+
+    def fake_fetch(
+        config: str,
+        split: str,
+        length: int,
+    ) -> tuple[dict[str, object], ...]:
+        called.append(config)
+        return jailbreaks if config == "judge_comparison" else benign
+
+    monkeypatch.setattr(module, "_fetch_rows", fake_fetch)
+
+
+def test_fetch_jbb_dataset_refuses_overwrite_of_frozen_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "cases.jsonl").write_text("[]", encoding="utf-8")
+    called: list[str] = []
+    _seeded_fetch_fixture(tmp_path, monkeypatch, called=called)
+
+    with pytest.raises(ValueError, match="overwrite"):
+        fetch_jbb_dataset(tmp_path, train_per_label=1, test_per_label=1)
+
+    assert called == []
+
+
+def test_fetch_jbb_dataset_overwrite_flag_allows_refetch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "cases.jsonl").write_text("[]", encoding="utf-8")
+    (tmp_path / "manifest.json").write_text("{}", encoding="utf-8")
+    called: list[str] = []
+    _seeded_fetch_fixture(tmp_path, monkeypatch, called=called)
+
+    fetch_jbb_dataset(
+        tmp_path,
+        train_per_label=1,
+        test_per_label=1,
+        overwrite=True,
+    )
+
+    assert called == ["judge_comparison", "behaviors"]

@@ -1,0 +1,24 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+.coverage
+.coverage.*
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+node_modules/
+
+# Local session and editor state (kept on disk, not in git)
+CHECKPOINT.md
+.opencode/
+.vscode/
+
+# Local-only evaluation artifacts (never delete; keep out of git)
+evaluation/data/jbb-v1/
+evaluation/results/smoke*
+metrics/telemetry.sqlite3*
+
+# SQLite sidecar files
+*.sqlite3-wal
+*.sqlite3-shm

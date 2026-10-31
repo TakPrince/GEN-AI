@@ -12,7 +12,7 @@ Most LLM security work treats red-teaming and guardrailing as separate problems:
 
 This project builds that closed loop: a stateful red-team orchestrator sends adversarial, multi-turn prompts at a **three-tier input guardrail → local LLM → three-tier output guardrail** pipeline. Every verdict, at every tier, is logged asynchronously. The resulting Attack Success Rate (ASR), False Positive Rate (FPR), and latency overhead are measured directly against the deployed defense, not against the raw model.
 
-The system is **local-first by design**: inference runs through Ollama or vLLM, the safety classifier is a locally-hosted Llama Guard model, and no component requires a paid or closed-source API. This keeps the full attack-defense-evaluation loop reproducible on a single machine.
+The system is **local-first by design**: inference runs through Ollama (vLLM is a planned alternative backend), the safety classifier is a locally-hosted Llama Guard model, and no component requires a paid or closed-source API. This keeps the full attack-defense-evaluation loop reproducible on a single machine.
 
 ---
 
@@ -37,7 +37,7 @@ The pipeline has nine components, executed in this order for every conversationa
 | 1   | **Red-Team Orchestrator**        | Drives one adversarial conversation per attack run; holds per-conversation state (`AttackState`) across turns so attacks can escalate instead of running single-shot.                                        |
 | 2   | **Prompt Mutator**               | Applies an attack technique to the next prompt — role-play wrapping, encoding, payload splitting, or a crescendo escalation step — based on the orchestrator's chosen probe.                                 |
 | 3   | **Three-Tier Input Guardrails**  | Screens the prompt _before_ it reaches the model: regex/canary check → embedding similarity → conditional Llama Guard classification. See §4.                                                                |
-| 4   | **Local LLM Inference**          | Generates a response via Ollama (`/api/generate`) or vLLM's OpenAI-compatible endpoint, isolated behind the input guardrail.                                                                                 |
+| 4   | **Local LLM Inference**          | Generates a response via Ollama (`/api/generate`; vLLM support is planned), isolated behind the input guardrail.                                                                                            |
 | 5   | **Three-Tier Output Guardrails** | Runs the same three-tier check on the model's response before it leaves the system (canary-leak and PII scanning included).                                                                                  |
 | 6   | **Response Router**              | Applies the final verdict: returns the response unmodified (`safe`), substitutes a canned refusal (`blocked`), or redacts (`partial`).                                                                       |
 | 7   | **Asynchronous Telemetry**       | Every tier emits a `{turn_id, stage, verdict, score, latency_ms}` event to a non-blocking queue/topic. Telemetry failures never affect the guardrail decision or response latency.                           |
@@ -52,7 +52,7 @@ flowchart LR
     MUT --> IG{"Input Guardrails<br/>Tier 1 → 2 → 3"}
 
     IG -- blocked --> R1["Canned Refusal<br/>(blocked)"]
-    IG -- pass --> LLM["Local LLM Inference<br/>Ollama / vLLM"]
+    IG -- pass --> LLM["Local LLM Inference<br/>Ollama (vLLM planned)"]
 
     LLM --> OG{"Output Guardrails<br/>Tier 1 → 2 → 3"}
     OG -- blocked --> R2["Canned Refusal<br/>(blocked)"]
@@ -117,7 +117,7 @@ Each is reported with more than a single aggregate number:
 - **Tensor Trust** — a dataset of adversarial prompt injections collected from an attacker/defender game. Intended as a source of real, human-discovered injection phrasing for the ASR attack set, rather than relying solely on synthetic templates.
 - **Project-specific benign set** — no public benchmark substitutes for domain-specific FPR measurement; this set must be curated from the target deployment's own traffic or documents.
 
-No benchmark runs have been executed yet; the above describes the intended evaluation design, not reported results.
+The planned external benchmarks above have not been run yet. One committed pilot run does exist and is reported in §9; the section that follows describes the evaluation design those and future runs follow.
 
 ---
 
@@ -143,13 +143,13 @@ Two proposed innovations distinguish this project from a standard red-team/guard
 
 | Layer                      | Core technology                                                                                              | Notes                                                                                    |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
-| Language                   | Python                                                                                                       | Orchestrator, guardrail middleware, evaluation tooling                                   |
-| Inference                  | Ollama and/or vLLM                                                                                           | Local-only; either is supported as the serving backend                                   |
-| API layer                  | FastAPI                                                                                                      | Hosts the defended `/v1/chat` endpoint and guardrail middleware                          |
+| Language                   | Python                                                                                                       | Guardrail libraries, evaluation tooling                                                  |
+| Inference                  | Ollama                                                                                                       | Local-only; vLLM is a planned alternative serving backend                                 |
+| Interface layer            | Streamlit dashboard (`src/safety_platform/app.py`) and a CLI evaluation harness; a FastAPI `/v1/chat` service is planned | The dashboard is a local closed-loop demo; the CLI runs and reports benchmark evaluations |
 | Tier 2 detection           | Local sentence-embedding model (e.g. a `sentence-transformers`-class model, or an Ollama embedding model)    | Cosine similarity against an attack-centroid index                                       |
 | Tier 3 detection           | Llama Guard (served locally via Ollama)                                                                      | Invoked conditionally                                                                    |
 | Telemetry                  | Async queue (`asyncio.Queue`) for single-node; Kafka/Redpanda as an alternative for multi-worker deployments | Non-blocking, bounded, drops telemetry under backpressure rather than blocking responses |
-| Evaluation storage         | SQLite (WAL mode) for local development; Postgres/DuckDB as an alternative at scale                          | Stores per-turn verdicts and transcripts                                                 |
+| Evaluation storage         | SQLite (committed); Postgres/DuckDB as a planned alternative at scale                        | Stores per-turn verdicts and transcripts                                                 |
 | Red-teaming design pattern | Garak-style probes / PyRIT-style orchestrator-converter composition                                          | Design pattern referenced, not a direct dependency                                       |
 | Benchmarks                 | CircleGuardBench, Tensor Trust                                                                               | External datasets for evaluation, per §5                                                 |
 
@@ -172,8 +172,9 @@ No component requires a paid or closed-source API.
 | Category                       | Status                                                                                                                                                                                                                              |
 | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Architecture specified**     | All nine components (§3), the three-tier cascade (§4), the evaluation methodology (§5), and both research contributions (§6) are fully specified in this document.                                                                  |
-| **Implemented and verified**   | No application code currently exists in this repository. The artifacts produced to date are this architecture specification and an accompanying presentation deck.                                                                  |
-| **Planned**                    | Orchestrator and probe implementation; FastAPI guardrail middleware (Tiers 1–3, both directions); async telemetry pipeline; evaluation store schema and ASR/FPR/latency computation; CircleGuardBench and Tensor Trust integration. |
-| **Experiments still required** | Baseline ASR/FPR/latency measurement on the initial static-threshold cascade; the Innovation 1 calibration A/B; the Innovation 2 routing A/B; multi-turn and partial-compliance evaluation at scale.                                |
+| **Implemented**                | The three-tier guardrail libraries (Tiers 1–3, response router, telemetry bus/consumer/store) live in `src/safety_platform/`; a Streamlit closed-loop dashboard (input-direction demo, local Tier-3 stub) and a CLI evaluation harness (`python -m safety_platform.evaluation`) are runnable; the output-direction arbitration prompt per the tuned design is implemented in the Tier-3 connector. Don't rely on the dashboard as a benchmark: its Tier 3 is a local stub and its target model is not connected. |
+| **Measured on a pilot sample** | A committed 60-case JBB v2 held-out evaluation (run `20261029T015710-587cb28a`, results in `evaluation/results/`) produced a credible negative finding: ASR 6.7% across baseline/input/full, FPR 10.0%, guard p95 ≈ 21 s, Tier-3 rate 51.7% (input) / 53.3% (full). This is a pilot-grade sample, not a success claim. |
+| **Planned**                    | Red-team orchestrator, prompt mutators, and multi-turn/partial-compliance evaluation; FastAPI `/v1/chat` service; calibration of the output-arbitration prompt on stored responses; canary/deny-list/PII output scanning; CircleGuardBench and Tensor Trust loaders; per-tier FPR attribution; Postgres/DuckDB/Kafka backends. |
+| **Experiments still required** | Larger held-out reruns beyond the 60-case pilot; the Innovation 1 calibration A/B; the Innovation 2 routing A/B (a trained-routing artifact, not hardcoded weights); iterative calibration cycles.                                   |
 
-Nothing in this README should be read as evidence that the pipeline has been built or that any benchmark numbers exist yet — it documents the design the implementation work will follow.
+The implementation state in this section reflects the current repository: guardrail libraries, telemetry, dashboard demo, and the evaluation harness are built and quality-gated (pytest/coverage/black/ruff/mypy/pyright), and one committed pilot evaluation produced a negative finding recorded with its full configuration — the numbers above are reported honestly as a negative result, not evidence of success.
