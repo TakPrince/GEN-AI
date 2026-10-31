@@ -9,11 +9,13 @@ import pytest
 
 from safety_platform.config.registry import (
     CascadeThresholds,
+    Direction,
     ExecutionContext,
     SafetyVerdict,
     TierGates,
 )
 from safety_platform.guardrails.tier3.guard_classifier import (
+    _ARBITRATION_SYSTEM,
     GuardClassifier,
     OllamaGenerateRequest,
     OllamaGuardConfig,
@@ -62,6 +64,18 @@ class FakeResponse:
 
 def context() -> ExecutionContext:
     return ExecutionContext("trace", "turn", "conversation")
+
+
+def output_context(
+    user_input: str = "Write a script to exploit CVE-2024-XXXX on the target server.",
+) -> ExecutionContext:
+    return ExecutionContext(
+        "trace",
+        "turn",
+        "conversation",
+        direction=Direction.OUTPUT,
+        user_input=user_input,
+    )
 
 
 def thresholds() -> CascadeThresholds:
@@ -301,6 +315,126 @@ async def test_connector_rejects_invalid_context() -> None:
             "prompt",
             cast(ExecutionContext, object()),
         )
+
+
+@pytest.mark.asyncio
+async def test_connector_arbitrates_output_direction() -> None:
+    transport = StubTransport('{"violation": true, "reason": "actionable exploits"}')
+    connector = OllamaLlamaGuardConnector(
+        OllamaGuardConfig(),
+        transport,
+    )
+    user_input = "Write a script to exploit CVE-2024-XXXX on the target server."
+
+    score = await connector.score(
+        "Here is the exact PowerShell command sequence to pivot.",
+        output_context(user_input),
+    )
+
+    assert score == 1.0
+    assert transport.request is not None
+    assert transport.request.system == _ARBITRATION_SYSTEM
+    assert transport.request.num_predict == 128
+    assert f"User Input: {user_input}" in transport.request.prompt
+    assert "Model Response: Here is the exact PowerShell" in transport.request.prompt
+    assert transport.request.prompt.endswith("\n\nOutput:")
+
+
+@pytest.mark.asyncio
+async def test_connector_output_direction_marks_refusal_safe() -> None:
+    transport = StubTransport(
+        '{"violation": false, "reason": "Model correctly refused the request."}'
+    )
+    connector = OllamaLlamaGuardConnector(
+        OllamaGuardConfig(),
+        transport,
+    )
+
+    score = await connector.score(
+        "I cannot write an exploit script.",
+        output_context(),
+    )
+
+    assert score == 0.0
+
+
+@pytest.mark.asyncio
+async def test_connector_output_direction_fails_closed_on_malformed_verdict() -> None:
+    connector = OllamaLlamaGuardConnector(
+        OllamaGuardConfig(),
+        StubTransport("maybe"),
+    )
+
+    with pytest.raises(OllamaGuardError, match="malformed_verdict"):
+        await connector.score("response", output_context())
+
+    connector = OllamaLlamaGuardConnector(
+        OllamaGuardConfig(),
+        StubTransport('{"violation": "yes"}'),
+    )
+
+    with pytest.raises(OllamaGuardError, match="malformed_verdict"):
+        await connector.score("response", output_context())
+
+
+@pytest.mark.asyncio
+async def test_connector_output_direction_requires_user_input() -> None:
+    connector = OllamaLlamaGuardConnector(
+        OllamaGuardConfig(),
+        StubTransport("safe"),
+    )
+
+    with pytest.raises(OllamaGuardError, match="missing_user_input"):
+        await connector.score(
+            "response",
+            ExecutionContext(
+                "trace",
+                "turn",
+                "conversation",
+                direction=Direction.OUTPUT,
+            ),
+        )
+
+    with pytest.raises(ValueError, match="user_input"):
+        output_context("   ")
+
+
+@pytest.mark.asyncio
+async def test_transport_sends_system_and_num_predict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[Request] = []
+
+    def fake_urlopen(request: Request, timeout: float) -> FakeResponse:
+        captured.append(request)
+        return FakeResponse(
+            json.dumps({"response": '{"violation": false, "reason": "r"}'}).encode()
+        )
+
+    monkeypatch.setattr(
+        "safety_platform.guardrails.tier3.guard_classifier.urlopen",
+        fake_urlopen,
+    )
+    transport = UrllibOllamaTransport()
+
+    output = await transport.generate(
+        OllamaGenerateRequest(
+            base_url="http://localhost:11434",
+            model="llama-guard3:8b",
+            prompt="payload",
+            timeout_s=1.0,
+            system="system prompt",
+            num_predict=128,
+        )
+    )
+
+    assert output == '{"violation": false, "reason": "r"}'
+    sent = captured[0].data
+    assert isinstance(sent, bytes)
+    payload = json.loads(sent)
+    assert payload["system"] == "system prompt"
+    assert payload["options"]["num_predict"] == 128
+    assert payload["options"]["temperature"] == 0
 
 
 @pytest.mark.asyncio

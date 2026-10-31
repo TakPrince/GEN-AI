@@ -178,6 +178,7 @@ class ExecutionContext:
     conversation_id: str
     direction: Direction = Direction.INPUT
     guardrail_version: str = "unversioned"
+    user_input: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.trace_id, "trace_id")
@@ -186,6 +187,8 @@ class ExecutionContext:
         _text(self.guardrail_version, "guardrail_version")
         if not isinstance(self.direction, Direction):
             raise TypeError("direction must be a Direction")
+        if self.user_input is not None:
+            _text(self.user_input, "user_input")
 
 
 @dataclass(frozen=True, slots=True)

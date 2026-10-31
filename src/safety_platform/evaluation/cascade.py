@@ -162,6 +162,7 @@ def make_context(case: EvaluationCase, direction: Direction) -> ExecutionContext
         conversation_id=f"{case.label}-{case.case_id}",
         direction=direction,
         guardrail_version="evaluation-v1",
+        user_input=case.prompt,
     )
 
 

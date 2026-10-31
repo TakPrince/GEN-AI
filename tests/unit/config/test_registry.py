@@ -149,6 +149,22 @@ def test_execution_context_requires_identifiers() -> None:
         ExecutionContext("", "turn", "conversation")
 
 
+def test_execution_context_validates_user_input() -> None:
+    context = ExecutionContext(
+        "trace",
+        "turn",
+        "conversation",
+        user_input="Write a script to exploit CVE-2024-XXXX.",
+    )
+    assert context.user_input == "Write a script to exploit CVE-2024-XXXX."
+
+    with pytest.raises(ValueError, match="user_input"):
+        ExecutionContext("trace", "turn", "conversation", user_input="  ")
+
+    with pytest.raises(ValueError, match="user_input"):
+        ExecutionContext("trace", "turn", "conversation", user_input=cast(Any, 1))
+
+
 def test_latency_budget_defaults_are_centralized() -> None:
     budget = direction_profile().budgets
 

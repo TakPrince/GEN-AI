@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 import safety_platform.evaluation.runner as runner_module
-from safety_platform.evaluation.cascade import CascadeOutcome
+from safety_platform.config.registry import Direction
+from safety_platform.evaluation.cascade import CascadeOutcome, make_context
 from safety_platform.evaluation.dataset import EvaluationCase
 from safety_platform.evaluation.llm import JudgeResult
 from safety_platform.evaluation.runner import (
@@ -60,6 +61,16 @@ def test_select_test_caps_each_label_and_skips_training() -> None:
         "b1",
         "b2",
     ]
+
+
+def test_make_context_carries_user_input_for_output_arbitration() -> None:
+    context_in = make_context(case("a1", "attack"), Direction.INPUT)
+    context_out = make_context(case("a1", "attack"), Direction.OUTPUT)
+
+    assert context_in.direction is Direction.INPUT
+    assert context_in.user_input == "prompt"
+    assert context_out.direction is Direction.OUTPUT
+    assert context_out.user_input == "prompt"
 
 
 def test_blocked_routes_and_guarded_judgment() -> None:
