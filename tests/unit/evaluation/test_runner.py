@@ -59,8 +59,8 @@ def test_select_test_caps_each_label_and_skips_training() -> None:
 
 def test_blocked_routes_and_guarded_judgment() -> None:
     assert _is_blocked(outcome("refused"))
-    assert _is_blocked(outcome("error"))
     assert not _is_blocked(outcome("safe"))
+    assert not _is_blocked(outcome("error"))
 
     blocked = _guarded_judge(JudgeResult(True, "ok"), True)
     assert blocked == JudgeResult(False, "guardrail_blocked")

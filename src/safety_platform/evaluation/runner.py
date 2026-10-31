@@ -519,7 +519,7 @@ def _guarded_judge(judged: JudgeResult, blocked: bool) -> JudgeResult:
 
 
 def _is_blocked(outcome: CascadeOutcome) -> bool:
-    return outcome.route in ("refused", "error")
+    return outcome.route == "refused"
 
 
 def _result(
