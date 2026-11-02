@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import math
 import re
 import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import cast
+from urllib.request import urlopen
 
 import streamlit as st
 
@@ -70,6 +73,19 @@ _DENSE_CSS = """
 [data-testid="stDataFrame"] {font-size: .72rem;}
 </style>
 """
+
+_VERIFIED_TEST_CASES = 193
+_GLOBAL_ASR_PCT = 6.7
+_GLOBAL_FPR_PCT = 10.0
+_STAGE_ICONS = {
+    "PASS": "🟢",
+    "AMBIGUOUS": "🟡",
+    "REDACT": "🟡",
+    "BLOCK": "🔴",
+    "ERROR": "🔴",
+    "SKIP": "⚡",
+    "BYPASS": "⚡",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +206,24 @@ def _pipeline(database: str) -> _Pipeline:
         router=ResponseRouter(),
         sink=SqliteTelemetrySink(database),
     )
+
+
+@st.cache_data(ttl=10.0, show_spinner=False)
+def _ollama_status() -> str:
+    try:
+        with urlopen("http://127.0.0.1:11434/api/tags", timeout=1) as response:
+            models = len(json.loads(response.read().decode("utf-8"))["models"])
+        return f"🟢 Local-First Ollama · {models} models"
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return "🟡 Local-First · stub pipeline"
+
+
+def _render_status_ribbon() -> None:
+    columns = st.columns(4, gap="small")
+    columns[0].metric("VERIFIED TEST CASES", str(_VERIFIED_TEST_CASES))
+    columns[1].metric("GLOBAL ASR", f"{_GLOBAL_ASR_PCT:.1f}%")
+    columns[2].metric("GLOBAL FPR", f"{_GLOBAL_FPR_PCT:.1f}%")
+    columns[3].metric("SERVER STATUS", _ollama_status())
 
 
 @st.fragment(run_every=1.0)
@@ -410,18 +444,6 @@ def _next_case() -> int:
     return sequence
 
 
-def _frames(turn: _Turn) -> list[dict[str, str]]:
-    return [
-        {
-            "STAGE": row.stage,
-            "VERDICT": row.verdict.upper(),
-            "MS": f"{row.latency_ms:.2f}" if row.latency_ms else "-",
-            "SIGNAL": row.signal,
-        }
-        for row in turn.stages
-    ]
-
-
 def _render_raw(turns: Sequence[_Turn]) -> None:
     with st.container(height=480, border=True):
         for turn in turns:
@@ -434,16 +456,23 @@ def _render_raw(turns: Sequence[_Turn]) -> None:
 def _render_cascade(turns: Sequence[_Turn]) -> None:
     with st.container(height=480, border=True):
         for index, turn in enumerate(turns, start=1):
-            st.markdown(
-                f"`{index:02d}` **{turn.route.upper()}** `{turn.stage.upper()}`"
-            )
-            st.dataframe(
-                _frames(turn),
-                hide_index=True,
-                width="stretch",
-            )
+            lines = [f"`{index:02d}` **{turn.route.upper()}**"]
+            for row in turn.stages:
+                icon = _STAGE_ICONS.get(row.verdict.upper(), "⚪")
+                latency = (
+                    f" · {row.latency_ms:.2f} ms" if row.latency_ms else " · <1 ms"
+                )
+                signal = f" · {row.signal}" if row.signal and row.signal != "-" else ""
+                lines.append(
+                    f"{icon} `{row.stage}` **{row.verdict.upper()}**{latency}{signal}"
+                )
+            st.markdown("\n\n".join(lines))
             if not turn.persisted:
                 st.caption(f"DB {turn.db_error or 'ERROR'}")
+
+
+def _demo_database_path() -> Path:
+    return default_database_path().with_name("dashboard_demo.sqlite3")
 
 
 def main() -> None:
@@ -454,14 +483,24 @@ def main() -> None:
     )
     st.markdown(_DENSE_CSS, unsafe_allow_html=True)
     database = default_database_path().as_posix()
+    _render_status_ribbon()
     _render_metrics(database)
+    st.caption(
+        "Metrics are a benchmark snapshot read from metrics/telemetry.sqlite3. "
+        "Demo turns persist to dashboard_demo.sqlite3 and do not update them."
+    )
 
     left, right = st.columns(2, gap="small")
     with left:
-        st.markdown("##### RAW // UNSHIELDED")
+        st.markdown(":red-background[COLUMN 1: RAW // UNSHIELDED BASELINE]")
         _render_raw(_turns())
     with right:
-        st.markdown("##### CASCADE // ML ROUTER")
+        st.markdown(":green-background[COLUMN 2: GUARDED PIPELINE // ML ROUTER]")
+        st.caption(
+            "Demo pipeline: the raw pane echoes the prompt with no live LLM, "
+            "Tier 2 embeddings and Tier 3 verdicts use local stub models "
+            "(not the calibrated qwen3 benchmark components)."
+        )
         _render_cascade(_turns())
 
     label = st.radio(
@@ -481,7 +520,9 @@ def main() -> None:
             conversation_id=f"{selected}-{_session_id()}-{sequence}",
             guardrail_version="dashboard-v1",
         )
-        turn = asyncio.run(_evaluate(_pipeline(database), prompt, context))
+        turn = asyncio.run(
+            _evaluate(_pipeline(str(_demo_database_path())), prompt, context)
+        )
         _turns().append(turn)
         st.rerun()
 

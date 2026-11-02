@@ -378,6 +378,30 @@ async def test_connector_output_direction_fails_closed_on_malformed_verdict() ->
 
 
 @pytest.mark.asyncio
+async def test_connector_output_rejects_oversized_user_input() -> None:
+    connector = OllamaLlamaGuardConnector(
+        OllamaGuardConfig(max_prompt_bytes=64),
+        StubTransport("safe"),
+    )
+
+    with pytest.raises(OllamaGuardError, match="prompt_too_large"):
+        await connector.score("response", output_context("x" * 65))
+    transport = connector._transport
+    assert isinstance(transport, StubTransport) and transport.request is None
+
+
+@pytest.mark.asyncio
+async def test_connector_output_fails_closed_on_broken_json_shapes() -> None:
+    for payload in ("{not json}", '{"violation":'):
+        connector = OllamaLlamaGuardConnector(
+            OllamaGuardConfig(),
+            StubTransport(payload),
+        )
+        with pytest.raises(OllamaGuardError, match="malformed_verdict"):
+            await connector.score("response", output_context())
+
+
+@pytest.mark.asyncio
 async def test_connector_output_direction_requires_user_input() -> None:
     connector = OllamaLlamaGuardConnector(
         OllamaGuardConfig(),

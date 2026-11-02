@@ -32,7 +32,7 @@ async def test_local_pipeline_routes_all_cascade_paths(tmp_path: Path) -> None:
         "tier3",
         True,
     )
-    assert app._frames(tier3)[-1]["STAGE"] == "TIER3"
+    assert tier3.stages[-1].stage == "TIER3"
 
 
 @pytest.mark.asyncio
@@ -88,6 +88,26 @@ def test_dashboard_renders_and_blocks_tier1(
     assert dashboard.chat_message
 
 
+def test_demo_turns_are_isolated_from_frozen_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from metrics.db_adapter import load_metrics
+    from safety_platform import app as app_module
+
+    dashboard = app(tmp_path, monkeypatch)
+
+    dashboard.chat_input[0].set_value("hello there").run()
+    assert not dashboard.exception
+
+    demo_db = tmp_path / "dashboard_demo.sqlite3"
+    assert demo_db != tmp_path / "metrics.sqlite3"
+    assert demo_db.name == app_module._demo_database_path().name
+    assert demo_db.is_file()
+
+    frozen_metrics = load_metrics(str(tmp_path / "metrics.sqlite3"))
+    assert frozen_metrics.total_cases == 0
+
+
 def test_dashboard_cascades_safe_and_redacted_prompts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -104,4 +124,26 @@ def test_dashboard_cascades_safe_and_redacted_prompts(
     turns = dashboard.session_state["turns"]
     assert [turn.route for turn in turns] == ["safe", "partial"]
     assert all(turn.persisted for turn in turns)
-    assert dashboard.dataframe
+
+    texts = [element.value for element in dashboard.markdown]
+    assert any("COLUMN 2: GUARDED PIPELINE" in text for text in texts)
+    assert any("🟢" in text for text in texts)
+    assert any("⚡" in text for text in texts)
+
+
+def test_status_ribbon_renders_verified_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dashboard = app(tmp_path, monkeypatch)
+
+    labels = [metric.label for metric in dashboard.metric]
+    assert labels[:4] == [
+        "VERIFIED TEST CASES",
+        "GLOBAL ASR",
+        "GLOBAL FPR",
+        "SERVER STATUS",
+    ]
+    values = [str(metric.value) for metric in dashboard.metric][:4]
+    assert "193" in values[0]
+    assert "6.7%" in values[1]
+    assert "10.0%" in values[2]

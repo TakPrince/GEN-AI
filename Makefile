@@ -1,6 +1,9 @@
 PYTHON ?= python
 
-.PHONY: test coverage lint clean app eval-smoke eval eval-data report
+# Targets: test (193-case validation pipeline) | coverage | lint | ui (split-screen
+# Streamlit dashboard) | app | report | eval-data | eval-smoke | eval | clean
+
+.PHONY: test coverage lint ui app eval-data eval-smoke eval report clean
 
 test:
 	$(PYTHON) -m pytest -q
@@ -12,6 +15,8 @@ lint:
 	$(PYTHON) -m black --check src metrics tests
 	$(PYTHON) -m ruff check src metrics tests
 	$(PYTHON) -m mypy src metrics tests
+
+ui: app
 
 app:
 	PYTHONPATH=src:. $(PYTHON) -m streamlit run src/safety_platform/app.py

@@ -13,6 +13,7 @@ from safety_platform.config.registry import (
 from safety_platform.guardrails.tier1.regex_filter import (
     RegexAction,
     RegexFilter,
+    RegexFilterResult,
     RegexRule,
 )
 from safety_platform.middleware.regex_filter import RegexFilterMiddleware
@@ -95,6 +96,46 @@ async def test_unexpected_detector_error_fails_closed() -> None:
 
     assert result.error == "RuntimeError"
     assert event.error == "RuntimeError"
+
+
+class RawVerdictDetector:
+    def __init__(self, raw: object) -> None:
+        self._raw = raw
+
+    def evaluate(self, text: str):
+        return RegexFilterResult(verdict=cast(SafetyVerdict, self._raw))
+
+
+@pytest.mark.asyncio
+async def test_decoded_raw_verdict_is_mapped_to_typed_enum() -> None:
+    bus = AsyncTelemetryBus()
+    middleware = RegexFilterMiddleware(
+        cast(RegexFilter, RawVerdictDetector("block")), bus
+    )
+    context = ExecutionContext("trace", "turn", "conversation")
+
+    result = await middleware("text", context)
+    event = await bus.receive()
+
+    assert result.verdict is SafetyVerdict.BLOCK
+    assert event.verdict is SafetyVerdict.BLOCK
+
+
+@pytest.mark.asyncio
+async def test_unknown_raw_verdict_fails_closed() -> None:
+    bus = AsyncTelemetryBus()
+    middleware = RegexFilterMiddleware(
+        cast(RegexFilter, RawVerdictDetector("curl-bypass")), bus
+    )
+    context = ExecutionContext("trace", "turn", "conversation")
+
+    result = await middleware("text", context)
+    event = await bus.receive()
+
+    assert result.verdict is SafetyVerdict.ERROR
+    assert result.error == "invalid_verdict"
+    assert event.verdict is SafetyVerdict.ERROR
+    assert event.error == "invalid_verdict"
 
 
 @pytest.mark.asyncio

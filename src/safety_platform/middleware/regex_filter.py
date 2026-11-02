@@ -4,6 +4,7 @@ import hashlib
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 
 from ..config.registry import (
     ExecutionContext,
@@ -46,6 +47,7 @@ class RegexFilterMiddleware:
                 verdict=SafetyVerdict.ERROR,
                 error=error,
             )
+        result = _typed_result(result)
 
         latency_ms = max(0.0, (self._clock() - started) / 1_000_000)
         event = TelemetryEvent(
@@ -59,7 +61,7 @@ class RegexFilterMiddleware:
             lane=TelemetryLane.DECISION,
             rule_ids=result.rule_ids,
             redaction_spans=result.redaction_spans,
-            error=error,
+            error=result.error,
         )
         try:
             self._telemetry.emit_nowait(event)
@@ -70,6 +72,17 @@ class RegexFilterMiddleware:
     @property
     def telemetry_failures(self) -> int:
         return self._telemetry_failures
+
+
+def _typed_result(result: RegexFilterResult) -> RegexFilterResult:
+    verdict = result.verdict
+    if isinstance(verdict, SafetyVerdict):
+        return result
+    try:
+        typed = SafetyVerdict(verdict)
+    except ValueError:
+        return replace(result, verdict=SafetyVerdict.ERROR, error="invalid_verdict")
+    return replace(result, verdict=typed)
 
 
 def _prompt_hash(text: str) -> str:
