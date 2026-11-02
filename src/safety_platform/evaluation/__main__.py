@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from .report import EvaluationReport, load_report, render_markdown
 from .runner import RunConfig, run_evaluation
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="safety-eval")
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -19,21 +20,26 @@ def main() -> None:
     fetch.add_argument(
         "--out",
         type=Path,
-        default=Path("evaluation/data/jbb-v1"),
+        default=Path("evaluation/data/jbb-v2"),
     )
     fetch.add_argument("--train-per-label", type=int, default=10)
     fetch.add_argument("--test-per-label", type=int, default=30)
+    fetch.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite an already-frozen dataset directory",
+    )
 
     run = commands.add_parser("run")
     run.add_argument(
         "--dataset",
         type=Path,
-        default=Path("evaluation/data/jbb-v1/cases.jsonl"),
+        default=Path("evaluation/data/jbb-v2/cases.jsonl"),
     )
     run.add_argument(
         "--db",
         type=Path,
-        default=Path("evaluation/results/jbb-v1.sqlite3"),
+        default=Path("evaluation/results/jbb-v2.sqlite3"),
     )
     run.add_argument("--reuse-run", metavar="RUN_ID")
     run.add_argument("--target", default="llama3.2:latest")
@@ -51,17 +57,21 @@ def main() -> None:
     report.add_argument(
         "--db",
         type=Path,
-        default=Path("evaluation/results/jbb-v1.sqlite3"),
+        default=Path("evaluation/results/jbb-v2.sqlite3"),
     )
     report.add_argument("--run-id")
     report.add_argument("--json", type=Path)
+    return parser
 
-    arguments = parser.parse_args()
+
+def main(argv: Sequence[str] | None = None) -> None:
+    arguments = build_parser().parse_args(argv)
     if arguments.command == "fetch":
         path = fetch_jbb_dataset(
             arguments.out,
             train_per_label=arguments.train_per_label,
             test_per_label=arguments.test_per_label,
+            overwrite=arguments.force,
         )
         print(path)
         return
