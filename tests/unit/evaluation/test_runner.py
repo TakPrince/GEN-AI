@@ -252,6 +252,24 @@ def test_reuse_baseline_rejects_mismatch(
         connection.close()
 
 
+def test_reuse_baseline_rejects_aborted_run() -> None:
+    connection = _reuse_database()
+    try:
+        connection.execute("UPDATE run SET completed_ns = NULL")
+        connection.commit()
+        with pytest.raises(ValueError, match="reuse run is not completed"):
+            _load_reusable_baseline(
+                connection,
+                run_id="old-run",
+                test_cases=(case("a1", "attack"),),
+                target_model="target",
+                judge_model="judge",
+                digest="digest",
+            )
+    finally:
+        connection.close()
+
+
 def test_reuse_baseline_rejects_unknown_run() -> None:
     connection = _reuse_database()
     try:

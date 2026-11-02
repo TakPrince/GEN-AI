@@ -354,7 +354,8 @@ def _load_reusable_baseline(
     digest: str,
 ) -> dict[str, tuple[_GeneratedCase, JudgeResult]]:
     meta = connection.execute(
-        "SELECT target_model, judge_model, dataset_digest FROM run WHERE run_id = ?",
+        "SELECT target_model, judge_model, dataset_digest, completed_ns "
+        "FROM run WHERE run_id = ?",
         (run_id,),
     ).fetchone()
     if meta is None:
@@ -365,6 +366,8 @@ def _load_reusable_baseline(
         raise ValueError("reuse run judge model does not match")
     if str(meta[2]) != digest:
         raise ValueError("reuse run dataset digest does not match")
+    if meta[3] is None:
+        raise ValueError("reuse run is not completed")
 
     rows = connection.execute(
         """
