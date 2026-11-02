@@ -123,9 +123,7 @@ def build_cascade(
     attacks = tuple(case for case in train_cases if case.label == "attack")
     if not attacks:
         raise ValueError("training split must contain attack cases")
-    active_thresholds = (
-        DEFAULT_CASCADE_THRESHOLDS if thresholds is None else thresholds
-    )
+    active_thresholds = DEFAULT_CASCADE_THRESHOLDS if thresholds is None else thresholds
     active_margins = RoutingMargins(0.01, 0.55) if margins is None else margins
     centroids = tuple(
         Centroid(case.case_id, embedder.embed(case.prompt)) for case in attacks
