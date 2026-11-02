@@ -1,7 +1,7 @@
 import asyncio
 import sqlite3
-from pathlib import Path
 from collections.abc import Sequence
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest

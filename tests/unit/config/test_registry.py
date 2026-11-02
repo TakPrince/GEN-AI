@@ -4,8 +4,8 @@ from typing import Any, cast
 import pytest
 
 from safety_platform.config.registry import (
-    CascadeThresholds,
     DEFAULT_CASCADE_THRESHOLDS,
+    CascadeThresholds,
     Direction,
     DirectionProfile,
     ExecutionContext,

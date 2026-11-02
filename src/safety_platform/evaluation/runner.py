@@ -14,8 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..config.registry import (
-    CascadeThresholds,
     DEFAULT_CASCADE_THRESHOLDS,
+    CascadeThresholds,
     Direction,
     RoutingMargins,
 )

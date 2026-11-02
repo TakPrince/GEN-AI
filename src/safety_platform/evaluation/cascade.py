@@ -7,8 +7,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from ..config.registry import (
-    CascadeThresholds,
     DEFAULT_CASCADE_THRESHOLDS,
+    CascadeThresholds,
     Direction,
     ExecutionContext,
     RouteVerdict,

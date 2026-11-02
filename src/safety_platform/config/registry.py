@@ -277,8 +277,8 @@ class TelemetryEvent:
 
 
 __all__ = [
-    "CascadeThresholds",
     "DEFAULT_CASCADE_THRESHOLDS",
+    "CascadeThresholds",
     "Direction",
     "DirectionProfile",
     "ExecutionContext",
