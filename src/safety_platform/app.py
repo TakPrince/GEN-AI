@@ -56,6 +56,7 @@ from safety_platform.research.ml_router import (
     RouterFeatures,
     Tier3BypassRouter,
 )
+from safety_platform.telemetry import AsyncTelemetryBus, TelemetryConsumer
 from safety_platform.telemetry.db_sink import SqliteTelemetrySink
 
 _TOKEN = re.compile(r"[a-z0-9_'-]+")
@@ -135,6 +136,8 @@ class _Pipeline:
     ml_router: ModelDrivenRouter
     router: ResponseRouter
     sink: SqliteTelemetrySink
+    bus: AsyncTelemetryBus
+    consumer: TelemetryConsumer
     cascade: CascadeRuntime
     echo_probe: SpeculativeEchoProbe | None = None
 
@@ -227,13 +230,20 @@ def _pipeline(database: str) -> _Pipeline:
     guard = GuardClassifier(_LocalClassifier(), _THRESHOLDS)
     ml_router = ModelDrivenRouter(Tier3BypassRouter(model))
     router = ResponseRouter()
+    sink = SqliteTelemetrySink(database)
+    # Per-turn drain (max_batch_wait_ms=0): Streamlit asyncio.run()s each turn on a
+    # fresh loop, so a long-lived consumer task cannot survive between reruns.
+    bus = AsyncTelemetryBus()
+    consumer = TelemetryConsumer(bus, sink, max_batch_wait_ms=0)
     return _Pipeline(
         regex=regex,
         vector=vector,
         guard=guard,
         ml_router=ml_router,
         router=router,
-        sink=SqliteTelemetrySink(database),
+        sink=sink,
+        bus=bus,
+        consumer=consumer,
         cascade=CascadeRuntime(
             regex=regex,
             vector=vector,
@@ -503,10 +513,21 @@ async def _persist(
     runtime: _Pipeline,
     events: Sequence[TelemetryEvent],
 ) -> tuple[bool, str | None]:
+    if not events:
+        return True, None
+    dropped = sum(1 for event in events if not runtime.bus.emit_nowait(event))
+    # With Streamlit spawning a fresh event loop per turn, the consumer is drained
+    # on the turn's own loop instead of a persistent background task.
+    stop = asyncio.Event()
+    stop.set()
     try:
-        await asyncio.to_thread(runtime.sink.append_many, events)
+        written = await runtime.consumer.run(stop=stop)
     except Exception as exc:
         return False, type(exc).__name__
+    if dropped:
+        return False, "queue_full"
+    if written < len(events) - dropped:
+        return False, runtime.consumer.stats.last_error or "consumer_failure"
     return True, None
 
 

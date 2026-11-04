@@ -89,21 +89,43 @@ async def test_wired_echo_probe_flows_into_telemetry_strip(tmp_path: Path) -> No
 
 @pytest.mark.asyncio
 async def test_persist_reports_database_failure(tmp_path: Path) -> None:
+    from collections.abc import Sequence
     from dataclasses import replace
     from typing import cast
 
     from safety_platform import app
-    from safety_platform.telemetry.db_sink import SqliteTelemetrySink
-
-    pipeline = app._pipeline(str(tmp_path / "metrics.sqlite3"))
+    from safety_platform.config.registry import (
+        ExecutionContext,
+        SafetyVerdict,
+        Stage,
+        TelemetryEvent,
+    )
+    from safety_platform.telemetry import AsyncTelemetryBus, TelemetryConsumer
+    from safety_platform.telemetry.db_sink import TelemetryStore
 
     class FailingSink:
-        def append_many(self, events: object) -> None:
+        def append_many(self, events: Sequence[object]) -> None:
             raise RuntimeError("offline")
 
-    failing = replace(pipeline, sink=cast(SqliteTelemetrySink, FailingSink()))
+    bus = AsyncTelemetryBus()
+    consumer = TelemetryConsumer(
+        bus,
+        cast(TelemetryStore, FailingSink()),
+        max_batch_wait_ms=0,
+    )
+    event = TelemetryEvent(
+        event_id="evt",
+        context=ExecutionContext("trace", "turn", "conversation"),
+        stage=Stage.TIER1,
+        verdict=SafetyVerdict.PASS,
+        latency_ms=0.1,
+        prompt_hash="hash",
+        timestamp_ns=1,
+    )
+    pipeline = app._pipeline(str(tmp_path / "metrics.sqlite3"))
+    failing = replace(pipeline, bus=bus, consumer=cast(TelemetryConsumer, consumer))
 
-    assert await app._persist(failing, ()) == (False, "RuntimeError")
+    assert await app._persist(failing, (event,)) == (False, "RuntimeError")
 
 
 def test_app_signal_helpers() -> None:
@@ -417,3 +439,144 @@ def test_new_pipeline_wraps_reusable_cascade_runtime(
     assert pipeline.cascade.guard is pipeline.guard
     assert pipeline.cascade.ml_router is pipeline.ml_router
     assert pipeline.cascade.router is pipeline.router
+
+
+def test_streamlit_reruns_reuse_one_bus_and_consumer(
+    tmp_path: Path,
+) -> None:
+    from safety_platform import app
+
+    database = str(tmp_path / "demo.sqlite3")
+    first = app._pipeline(database)
+    rerun = app._pipeline(database)
+
+    assert rerun is first
+    assert rerun.bus is first.bus
+    assert rerun.consumer is first.consumer
+
+
+@pytest.mark.asyncio
+async def test_turn_events_persist_via_bus_and_consumer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+
+    from safety_platform import app
+
+    completion = _CountingCompletion("greeting from the model")
+    monkeypatch.setattr(app, "_live_completion", completion)
+    database = tmp_path / "demo.sqlite3"
+    pipeline = app._pipeline(str(database))
+
+    turn = await _eval(pipeline, "hello")
+
+    assert turn.persisted
+    assert turn.db_error is None
+    assert pipeline.bus.size == 0
+    assert pipeline.consumer.stats.events_received > 0
+
+    rows = (
+        sqlite3.connect(database)
+        .execute(
+            "SELECT stage, verdict, lane, latency_ms, prompt_hash, timestamp_ns, "
+            "rule_ids, redaction_spans FROM stage_event"
+        )
+        .fetchall()
+    )
+
+    assert len(rows) == pipeline.consumer.stats.events_written
+    assert pipeline.consumer.stats.batches >= 1
+    assert {row[0] for row in rows} <= {"tier1", "tier2", "tier3", "router"}
+
+
+@pytest.mark.asyncio
+async def test_queue_saturation_drops_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sqlite3
+    from dataclasses import replace as dataclass_replace
+    from typing import cast
+
+    from safety_platform import app
+    from safety_platform.config.registry import (
+        ExecutionContext,
+        SafetyVerdict,
+        Stage,
+        TelemetryEvent,
+    )
+    from safety_platform.telemetry import AsyncTelemetryBus, TelemetryConsumer
+    from safety_platform.telemetry.db_sink import SqliteTelemetrySink
+
+    completion = _CountingCompletion()
+    monkeypatch.setattr(app, "_live_completion", completion)
+    database = tmp_path / "demo.sqlite3"
+    bus = AsyncTelemetryBus(maxsize=1)
+    sink = SqliteTelemetrySink(database)
+    consumer = TelemetryConsumer(bus, sink, max_batch_wait_ms=0)
+    backlog = TelemetryEvent(
+        event_id="backlog",
+        context=ExecutionContext("trace", "turn", "conversation"),
+        stage=Stage.TIER1,
+        verdict=SafetyVerdict.PASS,
+        latency_ms=0.1,
+        prompt_hash="hash",
+        timestamp_ns=1,
+    )
+    assert bus.emit_nowait(backlog)
+    pipeline = dataclass_replace(
+        app._pipeline(str(database)),
+        bus=bus,
+        consumer=cast(TelemetryConsumer, consumer),
+    )
+
+    turn = await _eval(pipeline, "hello")
+
+    assert not turn.persisted
+    assert turn.db_error == "queue_full"
+    assert bus.dropped > 0
+
+    rows = (
+        sqlite3.connect(database).execute("SELECT event_id FROM stage_event").fetchall()
+    )
+    assert ("backlog",) in rows
+
+
+@pytest.mark.asyncio
+async def test_consumer_store_failure_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections.abc import Sequence
+    from dataclasses import replace as dataclass_replace
+    from typing import cast
+
+    from safety_platform import app
+    from safety_platform.telemetry import AsyncTelemetryBus, TelemetryConsumer
+    from safety_platform.telemetry.db_sink import TelemetryStore
+
+    class FailingStore:
+        def append(self, event: object) -> int:
+            return self.append_many((event,))
+
+        def append_many(self, events: Sequence[object]) -> int:
+            raise RuntimeError("disk offline")
+
+    completion = _CountingCompletion()
+    monkeypatch.setattr(app, "_live_completion", completion)
+    bus = AsyncTelemetryBus()
+    store = TelemetryConsumer(
+        bus,
+        cast(TelemetryStore, FailingStore()),
+        max_batch_wait_ms=0,
+    )
+    pipeline = dataclass_replace(
+        app._pipeline(str(tmp_path / "demo.sqlite3")),
+        bus=bus,
+        consumer=cast(TelemetryConsumer, store),
+    )
+
+    turn = await _eval(pipeline, "hello")
+
+    assert not turn.persisted
+    assert turn.db_error == "RuntimeError"
+    assert store.stats.failures >= 1
+    assert bus.size == 0
