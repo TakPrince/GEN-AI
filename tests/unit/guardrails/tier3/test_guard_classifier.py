@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import cast
+from typing import Any, cast
 from urllib.error import URLError
 from urllib.request import Request
 
@@ -158,6 +158,112 @@ async def test_urllib_transport_parses_ollama_response(
     assert output == "unsafe\nS2"
     assert captured[0].full_url == "http://localhost:11434/api/generate"
     assert captured[0].get_method() == "POST"
+
+
+def _flaky_urlopen(
+    failures: tuple[BaseException, ...],
+    outcome: FakeResponse,
+) -> tuple[object, list[int]]:  # type: ignore[type-arg]
+    attempts: list[int] = []
+
+    def urlopen(*args: object, **kwargs: object) -> object:
+        attempts.append(len(attempts) + 1)
+        if len(attempts) <= len(failures):
+            raise failures[len(attempts) - 1]
+        return outcome
+
+    return urlopen, attempts
+
+
+def _request() -> OllamaGenerateRequest:
+    return OllamaGenerateRequest(
+        base_url="http://localhost:11434",
+        model="llama-guard3:8b",
+        prompt="prompt",
+        timeout_s=0.01,
+    )
+
+
+@pytest.mark.asyncio
+async def test_urllib_transport_retries_transient_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urlopen, attempts = _flaky_urlopen(
+        (URLError(ConnectionResetError("reset")),),
+        FakeResponse(json.dumps({"response": "unsafe\nS2"}).encode()),
+    )
+    monkeypatch.setattr(
+        "safety_platform.guardrails.tier3.guard_classifier.urlopen",
+        urlopen,
+    )
+
+    output = await UrllibOllamaTransport().generate(_request())
+
+    assert output == "unsafe\nS2"
+    assert len(attempts) == 2
+
+
+@pytest.mark.asyncio
+async def test_urllib_transport_stops_after_two_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urlopen, attempts = _flaky_urlopen(
+        (URLError(ConnectionResetError("reset")),) * 3,
+        FakeResponse(json.dumps({"response": "safe"}).encode()),
+    )
+    monkeypatch.setattr(
+        "safety_platform.guardrails.tier3.guard_classifier.urlopen",
+        urlopen,
+    )
+
+    with pytest.raises(OllamaGuardError, match="URLError"):
+        await UrllibOllamaTransport().generate(_request())
+
+    assert len(attempts) == 2
+
+
+@pytest.mark.asyncio
+async def test_urllib_transport_does_not_retry_permanent_http_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from urllib.error import HTTPError
+
+    urlopen, attempts = _flaky_urlopen(
+        (HTTPError("http://x", 503, "unavailable", cast(Any, {}), None),) * 3,
+        FakeResponse(json.dumps({"response": "safe"}).encode()),
+    )
+    monkeypatch.setattr(
+        "safety_platform.guardrails.tier3.guard_classifier.urlopen",
+        urlopen,
+    )
+
+    with pytest.raises(OllamaGuardError, match="HTTPError"):
+        await UrllibOllamaTransport().generate(_request())
+
+    assert len(attempts) == 1
+
+
+@pytest.mark.asyncio
+async def test_connector_composition_retries_once_not_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urlopen, attempts = _flaky_urlopen(
+        (URLError(ConnectionResetError("reset")),),
+        FakeResponse(json.dumps({"response": "safe"}).encode()),
+    )
+    monkeypatch.setattr(
+        "safety_platform.guardrails.tier3.guard_classifier.urlopen",
+        urlopen,
+    )
+    connector = OllamaLlamaGuardConnector(
+        OllamaGuardConfig(timeout_s=0.01),
+        transport=UrllibOllamaTransport(),
+    )
+
+    score = await connector.score("hello", context())
+
+    assert score == 0.0
+    assert len(attempts) == 2
 
 
 @pytest.mark.asyncio

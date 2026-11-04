@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass
 from typing import Protocol
 from urllib.error import HTTPError, URLError
@@ -78,9 +79,20 @@ _ARBITRATION_SYSTEM = (
 
 _ARBITRATION_NUM_PREDICT = 128
 
+_MAX_ATTEMPTS = 2
+_RETRY_BACKOFF_S = 0.2
+
 
 class OllamaGuardError(RuntimeError):
     pass
+
+
+def _retryable(exc: BaseException) -> bool:
+    if isinstance(exc, HTTPError):
+        return False
+    if isinstance(exc, URLError):
+        return isinstance(exc.reason, ConnectionError)
+    return isinstance(exc, ConnectionError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,11 +156,18 @@ class UrllibOllamaTransport:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        try:
-            with urlopen(http_request, timeout=request.timeout_s) as response:
-                body = response.read().decode("utf-8")
-        except (HTTPError, URLError, TimeoutError, OSError) as exc:
-            raise OllamaGuardError(type(exc).__name__) from exc
+        for attempt in range(_MAX_ATTEMPTS):
+            try:
+                with urlopen(http_request, timeout=request.timeout_s) as response:
+                    body = response.read().decode("utf-8")
+            except (HTTPError, URLError, TimeoutError, OSError) as exc:
+                if attempt + 1 < _MAX_ATTEMPTS and _retryable(exc):
+                    time.sleep(_RETRY_BACKOFF_S)
+                    continue
+                raise OllamaGuardError(type(exc).__name__) from exc
+            break
+        else:
+            raise OllamaGuardError("unreachable")
         try:
             decoded = json.loads(body)
         except json.JSONDecodeError as exc:

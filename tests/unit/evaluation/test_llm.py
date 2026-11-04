@@ -1,4 +1,7 @@
-from typing import Any
+from __future__ import annotations
+
+from typing import Any, cast
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -233,3 +236,110 @@ async def test_speculative_probe_transport_payload_is_minimal() -> None:
     options = _generate_payload(client)
     assert options["num_predict"] == 10
     assert options["temperature"] == 0.0
+
+
+class FlakyResponse:
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    def read(self) -> bytes:
+        return self._payload
+
+    def __enter__(self) -> FlakyResponse:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+
+def _flaky_urlopen(
+    failures: tuple[BaseException, ...],
+    outcomes: tuple[FlakyResponse, ...],
+) -> tuple[Any, list[int]]:
+    attempts: list[int] = []
+
+    def urlopen(*args: object, **kwargs: object) -> object:
+        attempts.append(len(attempts) + 1)
+        if len(attempts) <= len(failures):
+            raise failures[len(attempts) - 1]
+        return outcomes[0]
+
+    return urlopen, attempts
+
+
+def test_client_retries_transient_connection_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urlopen, attempts = _flaky_urlopen(
+        (URLError(ConnectionResetError("reset")),),
+        (FlakyResponse(b'{"response": "ok"}'),),
+    )
+    monkeypatch.setattr("safety_platform.evaluation.llm.urlopen", urlopen)
+
+    client = OllamaClient("model", timeout_s=0.01)
+
+    assert client.generate("prompt") == "ok"
+    assert len(attempts) == 2
+
+
+def test_client_stops_after_two_attempts_with_typed_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urlopen, attempts = _flaky_urlopen(
+        (URLError(ConnectionResetError("reset")),) * 3,
+        (),
+    )
+    monkeypatch.setattr("safety_platform.evaluation.llm.urlopen", urlopen)
+
+    with pytest.raises(OllamaError, match="URLError"):
+        OllamaClient("model", timeout_s=0.01).generate("prompt")
+
+    assert len(attempts) == 2
+
+
+def test_client_does_not_retry_permanent_http_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urlopen, attempts = _flaky_urlopen(
+        (HTTPError("http://x", 503, "unavailable", cast(Any, {}), None),) * 3,
+        (),
+    )
+    monkeypatch.setattr("safety_platform.evaluation.llm.urlopen", urlopen)
+
+    with pytest.raises(OllamaError, match="HTTPError"):
+        OllamaClient("model", timeout_s=0.01).generate("prompt")
+
+    assert len(attempts) == 1
+
+
+def test_client_does_not_retry_malformed_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urlopen, attempts = _flaky_urlopen(
+        (),
+        (FlakyResponse(b"not json"),),
+    )
+    monkeypatch.setattr("safety_platform.evaluation.llm.urlopen", urlopen)
+
+    with pytest.raises(OllamaError, match="malformed_json"):
+        OllamaClient("model", timeout_s=0.01).generate("prompt")
+
+    assert len(attempts) == 1
+
+
+@pytest.mark.asyncio
+async def test_nested_probe_path_retries_once_not_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    urlopen, attempts = _flaky_urlopen(
+        (URLError(ConnectionResetError("reset")),),
+        (FlakyResponse(b'{"response": "I cannot help with that."}'),),
+    )
+    monkeypatch.setattr("safety_platform.evaluation.llm.urlopen", urlopen)
+    client = OllamaClient("model", timeout_s=0.01)
+    probe = OllamaSpeculativeEchoProbe(client)
+
+    result = await probe.probe("message")
+
+    assert result.status in {"refusal", "refusal_detected", "unclear"}
+    assert len(attempts) == 2
