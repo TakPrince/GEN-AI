@@ -9,7 +9,7 @@ import re
 import time
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import cast
@@ -20,13 +20,17 @@ import streamlit as st
 from metrics.db_adapter import default_database_path, load_metrics
 from safety_platform.config.registry import (
     DEFAULT_CASCADE_THRESHOLDS,
+    Direction,
     ExecutionContext,
+    Route,
     RoutingMargins,
     SafetyVerdict,
     Stage,
     TelemetryEvent,
 )
+from safety_platform.evaluation.cascade import CascadeRuntime
 from safety_platform.evaluation.llm import (
+    _SPECULATIVE_VIOLATING,
     OllamaClient,
     OllamaError,
     OllamaSpeculativeEchoProbe,
@@ -96,6 +100,8 @@ _STAGE_ICONS = {
     "BYPASS": "⚡",
 }
 
+_REFUSAL = "I cannot help with that request."
+
 
 @dataclass(frozen=True, slots=True)
 class _StageRow:
@@ -129,6 +135,7 @@ class _Pipeline:
     ml_router: ModelDrivenRouter
     router: ResponseRouter
     sink: SqliteTelemetrySink
+    cascade: CascadeRuntime
     echo_probe: SpeculativeEchoProbe | None = None
 
 
@@ -217,13 +224,23 @@ def _pipeline(database: str) -> _Pipeline:
         bias=-2.5,
         threshold=0.50,
     )
+    guard = GuardClassifier(_LocalClassifier(), _THRESHOLDS)
+    ml_router = ModelDrivenRouter(Tier3BypassRouter(model))
+    router = ResponseRouter()
     return _Pipeline(
         regex=regex,
         vector=vector,
-        guard=GuardClassifier(_LocalClassifier(), _THRESHOLDS),
-        ml_router=ModelDrivenRouter(Tier3BypassRouter(model)),
-        router=ResponseRouter(),
+        guard=guard,
+        ml_router=ml_router,
+        router=router,
         sink=SqliteTelemetrySink(database),
+        cascade=CascadeRuntime(
+            regex=regex,
+            vector=vector,
+            guard=guard,
+            ml_router=ml_router,
+            router=router,
+        ),
         echo_probe=_speculative_echo_probe(),
     )
 
@@ -268,10 +285,34 @@ async def _evaluate(
     tier2 = VectorFilterMiddleware(runtime.vector, collector)
     rows: list[_StageRow] = []
 
-    raw = await asyncio.to_thread(_live_completion, prompt)
     echo_status = "unavailable"
     if runtime.echo_probe is not None:
-        echo_status = (await runtime.echo_probe.probe(raw)).status
+        echo_status = (await runtime.echo_probe.probe(prompt)).status
+        if echo_status == _SPECULATIVE_VIOLATING:
+            route = runtime.router.route(
+                context,
+                (
+                    StageDecision(
+                        stage=Stage.ROUTER,
+                        verdict=SafetyVerdict.BLOCK,
+                        reason_codes=("speculative_echo:violating",),
+                    ),
+                ),
+            )
+            rows.append(_StageRow("ML", "SKIP", 0.0, echo_status))
+            persisted, db_error = await _persist(runtime, collector.events)
+            return _Turn(
+                prompt=prompt,
+                raw=_REFUSAL,
+                route=route.route.value,
+                stage=route.stage.value,
+                stages=tuple(rows),
+                router_probability=0.0,
+                tier3_invoked=False,
+                persisted=persisted,
+                speculative_echo_status=echo_status,
+                db_error=db_error,
+            )
 
     first = await tier1(prompt, context)
     rows.append(
@@ -298,7 +339,7 @@ async def _evaluate(
         persisted, db_error = await _persist(runtime, collector.events)
         return _Turn(
             prompt=prompt,
-            raw=raw,
+            raw=_REFUSAL,
             route=route.route.value,
             stage=route.stage.value,
             stages=tuple(rows),
@@ -395,15 +436,61 @@ async def _evaluate(
             )
 
     route = runtime.router.route(context, decisions)
+    if route.route in (Route.REFUSED, Route.ERROR):
+        persisted, db_error = await _persist(runtime, collector.events)
+        return _Turn(
+            prompt=prompt,
+            raw=_REFUSAL,
+            route=route.route.value,
+            stage=route.stage.value,
+            stages=tuple(rows),
+            router_probability=decision.probability,
+            tier3_invoked=tier3_invoked,
+            persisted=persisted,
+            speculative_echo_status=echo_status,
+            db_error=db_error,
+        )
+
+    completion_prompt = route.safe_text or prompt
+    raw = await asyncio.to_thread(_live_completion, completion_prompt)
+
+    output_context = replace(
+        context,
+        direction=Direction.OUTPUT,
+        user_input=prompt,
+    )
+    output = await runtime.cascade.run(raw, output_context)
+    rows.append(
+        _StageRow(
+            "OGUARD",
+            output.verdict,
+            output.latency_ms,
+            f"tier:{output.stage}",
+        )
+    )
+
+    displayed = raw
+    final_route = route.route.value
+    final_stage = route.stage.value
+    if output.route in ("refused", "error"):
+        displayed = _REFUSAL
+        final_route = output.route
+        final_stage = output.stage
+    elif output.route == Route.PARTIAL.value:
+        redaction = runtime.regex.evaluate(raw)
+        displayed = redaction.redacted_text or raw
+        final_route = output.route
+        final_stage = output.stage
+
     persisted, db_error = await _persist(runtime, collector.events)
     return _Turn(
         prompt=prompt,
-        raw=raw,
-        route=route.route.value,
-        stage=route.stage.value,
+        raw=displayed,
+        route=final_route,
+        stage=final_stage,
         stages=tuple(rows),
         router_probability=decision.probability,
-        tier3_invoked=tier3_invoked,
+        tier3_invoked=tier3_invoked or output.tier3_invoked,
         persisted=persisted,
         routing_drift_score=routing_drift_score,
         token_anomaly_score=token_anomaly_score,
@@ -547,14 +634,16 @@ def main() -> None:
 
     left, right = st.columns(2, gap="small")
     with left:
-        st.markdown(":red-background[COLUMN 1: RAW // UNSHIELDED BASELINE]")
+        st.markdown(":blue-background[COLUMN 1: PROMPT // GUARDED MODEL OUTPUT]")
         _render_raw(_turns())
     with right:
         st.markdown(":green-background[COLUMN 2: GUARDED PIPELINE // ML ROUTER]")
         st.caption(
-            "Demo pipeline: the raw pane echoes the prompt with no live LLM, "
-            "Tier 2 embeddings and Tier 3 verdicts use local stub models "
-            "(not the calibrated qwen3 benchmark components)."
+            "Demo pipeline: input guards (Tier 1/2 + echo probe + ML router) run "
+            "before the target model; blocked, refused, or errored requests "
+            "make zero target calls, and every completion passes the output "
+            "guard before display. Tier 2 embeddings and Tier 3 verdicts use "
+            "local stub models (not the calibrated qwen3 benchmark components)."
         )
         _render_cascade(_turns())
 
