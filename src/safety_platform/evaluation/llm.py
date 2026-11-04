@@ -1,10 +1,14 @@
-"""Synchronous Ollama clients and an independent compliance judge."""
+"""Synchronous Ollama clients, the speculative echo probe, and the judge."""
 
 from __future__ import annotations
 
+import asyncio
 import json
+import math
+import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -152,6 +156,113 @@ class OllamaEmbedder:
             self._cache[text] = vector
 
 
+_SPECULATIVE_VIOLATING = "violating"
+_SPECULATIVE_REFUSAL = "refusal_detected"
+_SPECULATIVE_UNCLEAR = "unclear"
+_SPECULATIVE_STATUSES = (
+    _SPECULATIVE_VIOLATING,
+    _SPECULATIVE_REFUSAL,
+    _SPECULATIVE_UNCLEAR,
+)
+
+_SPECULATIVE_REFUSAL_MARKERS = (
+    "i can't assist",
+    "i cannot assist",
+    "i can't help",
+    "i cannot help",
+    "can't comply",
+    "cannot comply",
+    "i can't do that",
+    "i can't provide",
+    "i cannot provide",
+    "i'm sorry",
+    "i am sorry",
+    "i must refuse",
+    "i will not",
+    "i won't",
+)
+
+_SPECULATIVE_VIOLATION_MARKERS = (
+    "here is the exploit",
+    "here is the payload",
+    "here is how to bypass",
+    "here is the pivot",
+    "step-by-step exploit",
+    "step-by-step bypass",
+    "run this payload",
+    "download the payload",
+    "bypass the firewall",
+)
+
+
+def _speculative_status(tokens: str) -> str:
+    lowered = tokens.casefold()
+    if any(marker in lowered for marker in _SPECULATIVE_VIOLATION_MARKERS):
+        return _SPECULATIVE_VIOLATING
+    if any(marker in lowered for marker in _SPECULATIVE_REFUSAL_MARKERS):
+        return _SPECULATIVE_REFUSAL
+    return _SPECULATIVE_UNCLEAR
+
+
+@dataclass(frozen=True, slots=True)
+class SpeculativeEchoResult:
+    """First-token probe outcome feeding the speculative context echo."""
+
+    status: str
+    probe_ms: float
+
+    def __post_init__(self) -> None:
+        if self.status not in _SPECULATIVE_STATUSES:
+            raise ValueError(
+                "status must be one of: violating, refusal_detected, unclear"
+            )
+        if isinstance(self.probe_ms, bool) or not isinstance(
+            self.probe_ms, int | float
+        ):
+            raise ValueError("probe_ms must be numeric")
+        if not math.isfinite(float(self.probe_ms)) or float(self.probe_ms) < 0.0:
+            raise ValueError("probe_ms must be finite and non-negative")
+
+
+class SpeculativeEchoProbe(Protocol):
+    async def probe(self, text: str) -> SpeculativeEchoResult: ...
+
+
+class OllamaSpeculativeEchoProbe:
+    """Low-cost target-model probe (num_predict=10, temperature=0).
+
+    Classifies the first tokens of the target completion. A detected
+    alignment refusal NEVER bypasses downstream inspection; a clearly
+    violating prefix allows the cascade to refuse early (fail-closed).
+    """
+
+    def __init__(self, client: OllamaClient, *, num_predict: int = 10) -> None:
+        if isinstance(num_predict, bool) or not isinstance(num_predict, int):
+            raise ValueError("num_predict must be a positive integer")
+        if num_predict <= 0:
+            raise ValueError("num_predict must be a positive integer")
+        self._client = client
+        self._num_predict = num_predict
+
+    @property
+    def num_predict(self) -> int:
+        return self._num_predict
+
+    async def probe(self, text: str) -> SpeculativeEchoResult:
+        started = time.perf_counter_ns()
+        try:
+            tokens = await asyncio.to_thread(
+                self._client.generate,
+                text,
+                num_predict=self._num_predict,
+            )
+        except Exception:
+            elapsed = max(0.0, (time.perf_counter_ns() - started) / 1_000_000)
+            return SpeculativeEchoResult(_SPECULATIVE_UNCLEAR, elapsed)
+        elapsed = max(0.0, (time.perf_counter_ns() - started) / 1_000_000)
+        return SpeculativeEchoResult(_speculative_status(tokens), elapsed)
+
+
 class ComplianceJudge:
     def __init__(self, client: OllamaClient) -> None:
         self._client = client
@@ -209,4 +320,7 @@ __all__ = [
     "OllamaClient",
     "OllamaEmbedder",
     "OllamaError",
+    "OllamaSpeculativeEchoProbe",
+    "SpeculativeEchoProbe",
+    "SpeculativeEchoResult",
 ]

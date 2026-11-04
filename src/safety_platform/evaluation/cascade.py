@@ -22,11 +22,16 @@ from ..guardrails.tier2.vector_filter import Centroid, VectorFilter
 from ..guardrails.tier3.guard_classifier import GuardClassifier
 from ..research.ml_router import (
     LogisticRegressionRouter,
+    ModelDrivenRouter,
     RouterFeatures,
     Tier3BypassRouter,
 )
 from .dataset import EvaluationCase
-from .llm import OllamaEmbedder
+from .llm import (
+    _SPECULATIVE_VIOLATING,
+    OllamaEmbedder,
+    SpeculativeEchoProbe,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +42,7 @@ class CascadeOutcome:
     latency_ms: float
     tier3_invoked: bool
     tier2_similarity: float
+    speculative_echo_status: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,12 +50,35 @@ class CascadeRuntime:
     regex: RegexFilter
     vector: VectorFilter
     guard: GuardClassifier
-    ml_router: Tier3BypassRouter
+    ml_router: ModelDrivenRouter
     router: ResponseRouter
 
-    async def run(self, text: str, context: ExecutionContext) -> CascadeOutcome:
+    async def run(
+        self,
+        text: str,
+        context: ExecutionContext,
+        *,
+        probe: SpeculativeEchoProbe | None = None,
+    ) -> CascadeOutcome:
         started = time.perf_counter_ns()
         tier3_invoked = False
+        echo_status: str | None = None
+        if probe is not None:
+            echo = await probe.probe(text)
+            echo_status = echo.status
+            if echo.status == _SPECULATIVE_VIOLATING:
+                route = self.router.route(
+                    context,
+                    (
+                        StageDecision(
+                            stage=Stage.ROUTER,
+                            verdict=SafetyVerdict.BLOCK,
+                            reason_codes=("speculative_echo:violating",),
+                        ),
+                    ),
+                )
+                return _outcome(route, started, False, 0.0, echo_status)
+
         first = self.regex.evaluate(text)
         decisions = [
             StageDecision(
@@ -109,6 +138,7 @@ class CascadeRuntime:
             started,
             tier3_invoked,
             second.top_similarity,
+            echo_status,
         )
 
 
@@ -149,7 +179,7 @@ def build_cascade(
         regex=regex,
         vector=vector,
         guard=guard,
-        ml_router=Tier3BypassRouter(router_model),
+        ml_router=ModelDrivenRouter(Tier3BypassRouter(router_model)),
         router=ResponseRouter(),
     )
 
@@ -170,6 +200,7 @@ def _outcome(
     started: int,
     tier3_invoked: bool,
     tier2_similarity: float,
+    speculative_echo_status: str | None = None,
 ) -> CascadeOutcome:
     return CascadeOutcome(
         route=route.route.value,
@@ -178,6 +209,7 @@ def _outcome(
         latency_ms=max(0.0, (time.perf_counter_ns() - started) / 1_000_000),
         tier3_invoked=tier3_invoked,
         tier2_similarity=tier2_similarity,
+        speculative_echo_status=speculative_echo_status,
     )
 
 

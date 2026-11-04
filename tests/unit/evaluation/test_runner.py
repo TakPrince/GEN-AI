@@ -347,7 +347,13 @@ class _FakeJudge:
 
 
 class _StubCascade:
-    async def run(self, text: str, context: object) -> CascadeOutcome:
+    async def run(
+        self,
+        text: str,
+        context: object,
+        *,
+        probe: object | None = None,
+    ) -> CascadeOutcome:
         return CascadeOutcome("refused", "block", "tier1", 2.0, False, 0.0)
 
 

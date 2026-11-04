@@ -8,14 +8,18 @@ APP = Path(__file__).parents[2] / "src" / "safety_platform" / "app.py"
 
 def app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppTest:
     monkeypatch.setenv("SAFETY_TELEMETRY_DB", str(tmp_path / "metrics.sqlite3"))
+    monkeypatch.setenv("SAFETY_UI_SPECULATIVE_ECHO", "0")
     return AppTest.from_file(str(APP), default_timeout=30).run()
 
 
 @pytest.mark.asyncio
-async def test_local_pipeline_routes_all_cascade_paths(tmp_path: Path) -> None:
+async def test_local_pipeline_routes_all_cascade_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from safety_platform import app
     from safety_platform.config.registry import ExecutionContext
 
+    monkeypatch.setenv("SAFETY_UI_SPECULATIVE_ECHO", "0")
     pipeline = app._pipeline(str(tmp_path / "metrics.sqlite3"))
     context = ExecutionContext("trace", "turn", "conversation")
 
@@ -33,6 +37,48 @@ async def test_local_pipeline_routes_all_cascade_paths(tmp_path: Path) -> None:
         True,
     )
     assert tier3.stages[-1].stage == "TIER3"
+    assert safe.routing_drift_score < 0.60
+    assert safe.token_anomaly_score < 0.01
+    assert safe.speculative_echo_status == "unavailable"
+
+
+def test_speculative_echo_probe_seam_honors_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from safety_platform import app
+
+    monkeypatch.setenv("SAFETY_UI_SPECULATIVE_ECHO", "1")
+    assert app._speculative_echo_probe() is not None
+
+    monkeypatch.setenv("SAFETY_UI_SPECULATIVE_ECHO", "0")
+    assert app._speculative_echo_probe() is None
+
+
+@pytest.mark.asyncio
+async def test_wired_echo_probe_flows_into_telemetry_strip(tmp_path: Path) -> None:
+    from dataclasses import replace
+    from typing import cast
+
+    from safety_platform import app
+    from safety_platform.config.registry import ExecutionContext
+    from safety_platform.evaluation.llm import (
+        SpeculativeEchoProbe,
+        SpeculativeEchoResult,
+    )
+
+    class ScriptedProbe:
+        async def probe(self, text: str) -> SpeculativeEchoResult:
+            return SpeculativeEchoResult("refusal_detected", 0.0)
+
+    pipeline = app._pipeline(str(tmp_path / "metrics.sqlite3"))
+    pipeline = replace(pipeline, echo_probe=cast(SpeculativeEchoProbe, ScriptedProbe()))
+
+    turn = await app._evaluate(
+        pipeline, "hello", ExecutionContext("trace", "turn", "conversation")
+    )
+
+    assert turn.speculative_echo_status == "refusal_detected"
+    assert app._telemetry_strip(turn).endswith("ECHO refusal_detected")
 
 
 @pytest.mark.asyncio
@@ -85,6 +131,7 @@ def test_dashboard_renders_and_blocks_tier1(
     assert turns[0].route == "refused"
     assert turns[0].stage == "tier1"
     assert turns[0].persisted
+    assert turns[0].speculative_echo_status == "unavailable"
     assert dashboard.chat_message
 
 
@@ -129,6 +176,7 @@ def test_dashboard_cascades_safe_and_redacted_prompts(
     assert any("COLUMN 2: GUARDED PIPELINE" in text for text in texts)
     assert any("🟢" in text for text in texts)
     assert any("⚡" in text for text in texts)
+    assert any("ECHO unavailable" in text for text in texts)
 
 
 def test_status_ribbon_renders_verified_metrics(

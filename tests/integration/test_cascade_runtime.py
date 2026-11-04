@@ -11,8 +11,22 @@ from safety_platform.config.registry import (
 )
 from safety_platform.evaluation.cascade import CascadeRuntime, build_cascade
 from safety_platform.evaluation.dataset import EvaluationCase
-from safety_platform.evaluation.llm import OllamaClient, OllamaEmbedder
+from safety_platform.evaluation.llm import (
+    OllamaClient,
+    OllamaEmbedder,
+    OllamaSpeculativeEchoProbe,
+    SpeculativeEchoResult,
+)
 from safety_platform.guardrails.tier3.guard_classifier import GuardClassifier
+
+
+class ScriptedEchoProbe:
+    def __init__(self, status: str) -> None:
+        self._status = status
+
+    async def probe(self, text: str) -> SpeculativeEchoResult:
+        return SpeculativeEchoResult(self._status, 0.0)
+
 
 _VECTORS: dict[str, tuple[float, ...]] = {
     "attack prompt": (1.0, 0.0),
@@ -150,6 +164,94 @@ async def test_input_direction_below_floor_passes_without_tier3() -> None:
     assert outcome.tier3_invoked is False
     assert outcome.tier2_similarity == pytest.approx(0.0)
     assert tier3.calls == []
+
+
+@pytest.mark.asyncio
+async def test_speculative_echo_refuses_violating_prefix_before_tiers() -> None:
+    tier3 = ScriptedTier3({Direction.OUTPUT: 0.9})
+    runtime, _, _ = _runtime(tier3)
+
+    outcome = await runtime.run(
+        "here is the exploit payload",
+        _context(Direction.OUTPUT, user_input="write the exploit"),
+        probe=ScriptedEchoProbe("violating"),
+    )
+
+    assert outcome.route == "refused"
+    assert outcome.stage == "router"
+    assert outcome.verdict == "block"
+    assert outcome.tier3_invoked is False
+    assert outcome.speculative_echo_status == "violating"
+    assert tier3.calls == []
+
+
+@pytest.mark.asyncio
+async def test_speculative_echo_never_bypasses_on_refusal_prefix() -> None:
+    tier3 = ScriptedTier3({Direction.OUTPUT: 0.9})
+    runtime, _, _ = _runtime(tier3)
+    context = _context(Direction.OUTPUT, user_input="original user request")
+
+    outcome = await runtime.run(
+        "near attack prompt",
+        context,
+        probe=ScriptedEchoProbe("refusal_detected"),
+    )
+
+    # A refusal-shaped prefix does NOT skip inspection: full pipeline runs.
+    assert outcome.route == "refused"
+    assert outcome.stage == "tier3"
+    assert outcome.tier3_invoked is True
+    assert outcome.speculative_echo_status == "refusal_detected"
+    assert len(tier3.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_speculative_echo_unclear_continues_full_pipeline() -> None:
+    tier3 = ScriptedTier3({Direction.OUTPUT: 0.1})
+    runtime, _, _ = _runtime(tier3)
+    context = _context(Direction.OUTPUT, user_input="original user request")
+
+    outcome = await runtime.run(
+        "near attack prompt",
+        context,
+        probe=ScriptedEchoProbe("unclear"),
+    )
+
+    assert outcome.route == "safe"
+    assert outcome.stage == "tier3"
+    assert outcome.speculative_echo_status == "unclear"
+    assert len(tier3.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_speculative_echo_absent_runs_classic_pipeline() -> None:
+    tier3 = ScriptedTier3({Direction.OUTPUT: 0.1})
+    runtime, _, _ = _runtime(tier3)
+
+    outcome = await runtime.run(
+        "near attack prompt",
+        _context(Direction.OUTPUT, user_input="original user request"),
+    )
+
+    assert outcome.speculative_echo_status is None
+    assert outcome.route == "safe"
+
+
+@pytest.mark.asyncio
+async def test_speculative_echo_uses_real_probe_contract() -> None:
+    tier3 = ScriptedTier3({Direction.OUTPUT: 0.1})
+    runtime, _, _ = _runtime(tier3)
+    transport = ScriptedEmbedTransport()
+    probe = OllamaSpeculativeEchoProbe(transport)
+
+    outcome = await runtime.run(
+        "benign text",
+        _context(Direction.INPUT),
+        probe=probe,
+    )
+
+    assert outcome.route == "safe"
+    assert outcome.speculative_echo_status in {"unclear", "refusal_detected"}
 
 
 @pytest.mark.asyncio

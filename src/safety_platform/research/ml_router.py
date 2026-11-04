@@ -205,6 +205,39 @@ class Tier3BypassRouter:
         )
 
 
+class ModelDrivenRouter:
+    """Hazard-boundary drift guard over the statistical bypass router.
+
+    Drops the rapid-bypass path whenever the Tier-2 embedding drifts toward a
+    hazardous centroid, independent of the learned bypass probability. The
+    guard is fail-closed: ambiguous or drifted inputs always escalate.
+    """
+
+    def __init__(
+        self,
+        base: Tier3BypassRouter,
+        *,
+        drift_floor: float = 0.60,
+    ) -> None:
+        if not isinstance(base, Tier3BypassRouter):
+            raise TypeError("base must be a Tier3BypassRouter")
+        _unit(drift_floor, "drift_floor")
+        self._base = base
+        self._drift_floor = float(drift_floor)
+
+    @property
+    def drift_floor(self) -> float:
+        return self._drift_floor
+
+    def route(self, features: RouterFeatures) -> RouterDecision:
+        if not isinstance(features, RouterFeatures):
+            raise TypeError("features must be RouterFeatures")
+        decision = self._base.route(features)
+        if features.top_similarity >= self._drift_floor and not decision.invoke_tier3:
+            return RouterDecision(invoke_tier3=True, probability=decision.probability)
+        return decision
+
+
 def _sigmoid(value: float) -> float:
     if value >= 0.0:
         scaled = math.exp(-value)
@@ -215,6 +248,7 @@ def _sigmoid(value: float) -> float:
 
 __all__ = [
     "LogisticRegressionRouter",
+    "ModelDrivenRouter",
     "RouterDecision",
     "RouterFeatures",
     "RouterSample",

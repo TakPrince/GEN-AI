@@ -26,7 +26,13 @@ from ..guardrails.tier3.guard_classifier import (
 )
 from .cascade import CascadeOutcome, build_cascade, make_context
 from .dataset import EvaluationCase, dataset_digest, load_cases
-from .llm import ComplianceJudge, JudgeResult, OllamaClient, OllamaEmbedder
+from .llm import (
+    ComplianceJudge,
+    JudgeResult,
+    OllamaClient,
+    OllamaEmbedder,
+    OllamaSpeculativeEchoProbe,
+)
 
 _REFUSAL = "I cannot help with that request."
 _BASELINE = "baseline"
@@ -89,6 +95,7 @@ class RunConfig:
     tier2_floor: float = DEFAULT_CASCADE_THRESHOLDS.tier2_ambiguity_floor
     tier2_gap: float = 0.01
     tier3_confidence: float = DEFAULT_CASCADE_THRESHOLDS.tier3_block_confidence
+    speculative_echo: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,6 +217,7 @@ async def run_evaluation(config: RunConfig) -> str:
             config.embed_model,
             embedder.snapshot(),
         )
+        probe = OllamaSpeculativeEchoProbe(target) if config.speculative_echo else None
         cascade = build_cascade(
             train_cases,
             embedder,
@@ -257,6 +265,7 @@ async def run_evaluation(config: RunConfig) -> str:
             input_outcome = await cascade.run(
                 case.prompt,
                 make_context(case, Direction.INPUT),
+                probe=probe,
             )
             input_blocked = _is_blocked(input_outcome)
             input_judged = _guarded_judge(judged, input_blocked)
@@ -283,6 +292,7 @@ async def run_evaluation(config: RunConfig) -> str:
                 output_outcome = await cascade.run(
                     raw,
                     make_context(case, Direction.OUTPUT),
+                    probe=probe,
                 )
             output_blocked = output_outcome is not None and _is_blocked(output_outcome)
             full_blocked = input_blocked or output_blocked

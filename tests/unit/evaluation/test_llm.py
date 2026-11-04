@@ -8,6 +8,7 @@ from safety_platform.evaluation.llm import (
     OllamaClient,
     OllamaEmbedder,
     OllamaError,
+    OllamaSpeculativeEchoProbe,
 )
 
 
@@ -154,3 +155,81 @@ def test_embedder_snapshot_and_seed() -> None:
         embedder.seed((("bad", (True,)),))
     with pytest.raises(ValueError, match="non-empty"):
         embedder.seed((("empty", ()),))
+
+
+def _generate_payload(client: StubClient) -> dict[str, dict[str, object]]:
+    options = client.payload["options"]
+    assert isinstance(options, dict)
+    return options
+
+
+@pytest.mark.asyncio
+async def test_speculative_probe_classifies_alignment_refusals() -> None:
+    client = StubClient({"response": "I cannot assist with that request."})
+    probe = OllamaSpeculativeEchoProbe(client)
+
+    result = await probe.probe("exploit the host")
+
+    assert result.status == "refusal_detected"
+    assert result.probe_ms >= 0.0
+    assert _generate_payload(client)["num_predict"] == 10
+    assert _generate_payload(client)["temperature"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_speculative_probe_classifies_violating_tokens() -> None:
+    payload = StubClient(
+        {"response": "here is the exploit: run this payload to bypass the firewall"}
+    )
+    probe = OllamaSpeculativeEchoProbe(payload)
+
+    result = await probe.probe("write the exploit script")
+
+    assert result.status == "violating"
+    assert result.probe_ms >= 0.0
+
+
+@pytest.mark.asyncio
+async def test_speculative_probe_returns_unclear_for_neutral_tokens() -> None:
+    payload = StubClient(
+        {"response": "The proposed marketing strategy is on progress!"}
+    )
+    probe = OllamaSpeculativeEchoProbe(payload)
+
+    result = await probe.probe("something benign")
+
+    assert result.status == "unclear"
+
+
+@pytest.mark.asyncio
+async def test_speculative_probe_fails_open_to_unclear_on_transport_error() -> None:
+    class RaisingClient(StubClient):
+        def _post(self, path: str, payload: dict[str, object]) -> dict[str, object]:
+            raise OllamaError("offline")
+
+    probe = OllamaSpeculativeEchoProbe(RaisingClient({"response": "ignored"}))
+
+    result = await probe.probe("text")
+
+    assert result.status == "unclear"
+
+
+def test_speculative_probe_validates_configuration() -> None:
+    client = StubClient({"response": "hi"})
+    with pytest.raises(ValueError, match="num_predict"):
+        OllamaSpeculativeEchoProbe(client, num_predict=0)
+    with pytest.raises(ValueError, match="num_predict"):
+        OllamaSpeculativeEchoProbe(client, num_predict=True)
+
+    with pytest.raises(ValueError, match="num_predict"):
+        OllamaSpeculativeEchoProbe(client, num_predict=0)
+
+
+@pytest.mark.asyncio
+async def test_speculative_probe_transport_payload_is_minimal() -> None:
+    client = StubClient({"response": "hi"})
+    await OllamaSpeculativeEchoProbe(client).probe("text")
+
+    options = _generate_payload(client)
+    assert options["num_predict"] == 10
+    assert options["temperature"] == 0.0

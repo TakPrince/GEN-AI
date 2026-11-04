@@ -4,11 +4,58 @@ import pytest
 
 from safety_platform.research.ml_router import (
     LogisticRegressionRouter,
+    ModelDrivenRouter,
     RouterDecision,
     RouterFeatures,
     RouterSample,
     Tier3BypassRouter,
 )
+
+
+def _distant_base() -> Tier3BypassRouter:
+    # Bias pushes every model score away from the escalation threshold.
+    return Tier3BypassRouter(
+        LogisticRegressionRouter(weights=(1.0, 1.0, -0.3, 3.0, 0.2), bias=-9.0)
+    )
+
+
+def test_model_driven_router_drops_bypass_near_hazard_boundary() -> None:
+    router = ModelDrivenRouter(
+        _distant_base(),
+        drift_floor=0.60,
+    )
+
+    decision = router.route(features(0.65))
+
+    assert decision.invoke_tier3 is True
+    assert decision.probability < 0.5
+
+
+def test_model_driven_router_preserves_rapid_bypass_when_distant() -> None:
+    router = ModelDrivenRouter(_distant_base(), drift_floor=0.60)
+
+    decision = router.route(features(0.10))
+
+    assert decision.bypass_tier3 is True
+    assert decision.probability < 0.5
+
+
+def test_model_driven_router_uses_default_drift_floor() -> None:
+    router = ModelDrivenRouter(_distant_base())
+
+    assert router.route(features(0.59, True)).bypass_tier3 is True
+    assert router.route(features(0.60, True)).invoke_tier3 is True
+
+
+def test_model_driven_router_validates_floors() -> None:
+    base = cast(Tier3BypassRouter, _distant_base())
+    with pytest.raises(ValueError, match="drift_floor"):
+        ModelDrivenRouter(base, drift_floor=1.2)
+    with pytest.raises(ValueError, match="drift_floor"):
+        ModelDrivenRouter(base, drift_floor=-0.1)
+    with pytest.raises(TypeError, match="features"):
+        router = ModelDrivenRouter(base)
+        router.route(cast(RouterFeatures, 1.0))
 
 
 def features(similarity: float, ambiguous: bool = False) -> RouterFeatures:

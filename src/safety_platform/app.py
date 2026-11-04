@@ -4,11 +4,13 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import re
 import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import cast
 from urllib.request import urlopen
@@ -23,6 +25,12 @@ from safety_platform.config.registry import (
     SafetyVerdict,
     Stage,
     TelemetryEvent,
+)
+from safety_platform.evaluation.llm import (
+    OllamaClient,
+    OllamaError,
+    OllamaSpeculativeEchoProbe,
+    SpeculativeEchoProbe,
 )
 from safety_platform.guardrails.router import ResponseRouter, StageDecision
 from safety_platform.guardrails.tier1.regex_filter import (
@@ -40,6 +48,7 @@ from safety_platform.middleware.regex_filter import RegexFilterMiddleware
 from safety_platform.middleware.vector_filter import VectorFilterMiddleware
 from safety_platform.research.ml_router import (
     LogisticRegressionRouter,
+    ModelDrivenRouter,
     RouterFeatures,
     Tier3BypassRouter,
 )
@@ -106,6 +115,9 @@ class _Turn:
     router_probability: float
     tier3_invoked: bool
     persisted: bool
+    routing_drift_score: float = 0.0
+    token_anomaly_score: float = 0.0
+    speculative_echo_status: str = "unavailable"
     db_error: str | None = None
 
 
@@ -114,9 +126,10 @@ class _Pipeline:
     regex: RegexFilter
     vector: VectorFilter
     guard: GuardClassifier
-    ml_router: Tier3BypassRouter
+    ml_router: ModelDrivenRouter
     router: ResponseRouter
     sink: SqliteTelemetrySink
+    echo_probe: SpeculativeEchoProbe | None = None
 
 
 class _HashingEmbedder:
@@ -152,6 +165,12 @@ class _Collector:
     def emit_nowait(self, event: TelemetryEvent) -> bool:
         self.events.append(event)
         return True
+
+
+def _speculative_echo_probe() -> SpeculativeEchoProbe | None:
+    if os.environ.get("SAFETY_UI_SPECULATIVE_ECHO", "1") == "0":
+        return None
+    return OllamaSpeculativeEchoProbe(OllamaClient(_COMPLETION_MODEL))
 
 
 @st.cache_resource(show_spinner=False)
@@ -202,9 +221,10 @@ def _pipeline(database: str) -> _Pipeline:
         regex=regex,
         vector=vector,
         guard=GuardClassifier(_LocalClassifier(), _THRESHOLDS),
-        ml_router=Tier3BypassRouter(model),
+        ml_router=ModelDrivenRouter(Tier3BypassRouter(model)),
         router=ResponseRouter(),
         sink=SqliteTelemetrySink(database),
+        echo_probe=_speculative_echo_probe(),
     )
 
 
@@ -248,6 +268,11 @@ async def _evaluate(
     tier2 = VectorFilterMiddleware(runtime.vector, collector)
     rows: list[_StageRow] = []
 
+    raw = await asyncio.to_thread(_live_completion, prompt)
+    echo_status = "unavailable"
+    if runtime.echo_probe is not None:
+        echo_status = (await runtime.echo_probe.probe(raw)).status
+
     first = await tier1(prompt, context)
     rows.append(
         _StageRow(
@@ -273,17 +298,21 @@ async def _evaluate(
         persisted, db_error = await _persist(runtime, collector.events)
         return _Turn(
             prompt=prompt,
-            raw=_raw_completion(prompt),
+            raw=raw,
             route=route.route.value,
             stage=route.stage.value,
             stages=tuple(rows),
             router_probability=0.0,
             tier3_invoked=False,
             persisted=persisted,
+            speculative_echo_status=echo_status,
             db_error=db_error,
         )
 
     second = await tier2(prompt, context)
+    prompt_bytes = len(prompt.encode("utf-8", "surrogatepass"))
+    routing_drift_score = second.top_similarity
+    token_anomaly_score = min(1.0, prompt_bytes / 4096)
     rows.append(
         _StageRow(
             "TIER2",
@@ -312,7 +341,7 @@ async def _evaluate(
             top_similarity=second.top_similarity,
             top_gap=second.top_gap,
             tier2_ambiguous=second.verdict is SafetyVerdict.AMBIGUOUS,
-            prompt_bytes=len(prompt.encode("utf-8", "surrogatepass")),
+            prompt_bytes=prompt_bytes,
         )
     )
     rows.append(
@@ -369,13 +398,16 @@ async def _evaluate(
     persisted, db_error = await _persist(runtime, collector.events)
     return _Turn(
         prompt=prompt,
-        raw=_raw_completion(prompt),
+        raw=raw,
         route=route.route.value,
         stage=route.stage.value,
         stages=tuple(rows),
         router_probability=decision.probability,
         tier3_invoked=tier3_invoked,
         persisted=persisted,
+        routing_drift_score=routing_drift_score,
+        token_anomaly_score=token_anomaly_score,
+        speculative_echo_status=echo_status,
         db_error=db_error,
     )
 
@@ -419,6 +451,20 @@ def _raw_completion(prompt: str) -> str:
     return prompt
 
 
+_COMPLETION_MODEL = "qwen3:8b"
+
+
+@lru_cache(maxsize=64)
+def _live_completion(prompt: str) -> str:
+    try:
+        completion = OllamaClient(_COMPLETION_MODEL).generate(
+            prompt, think=False, num_predict=16
+        )
+        return completion.strip() or _raw_completion(prompt)
+    except (OllamaError, KeyError, TypeError, ValueError):
+        return _raw_completion(prompt)
+
+
 def _turns() -> list[_Turn]:
     value = st.session_state.get("turns")
     if isinstance(value, list):
@@ -453,6 +499,14 @@ def _render_raw(turns: Sequence[_Turn]) -> None:
                 st.code(turn.raw, language="text")
 
 
+def _telemetry_strip(turn: _Turn) -> str:
+    return (
+        f"DRIFT {turn.routing_drift_score:.2f} · "
+        f"TOKEN {turn.token_anomaly_score:.2f} · "
+        f"ECHO {turn.speculative_echo_status}"
+    )
+
+
 def _render_cascade(turns: Sequence[_Turn]) -> None:
     with st.container(height=480, border=True):
         for index, turn in enumerate(turns, start=1):
@@ -466,6 +520,7 @@ def _render_cascade(turns: Sequence[_Turn]) -> None:
                 lines.append(
                     f"{icon} `{row.stage}` **{row.verdict.upper()}**{latency}{signal}"
                 )
+            lines.append(_telemetry_strip(turn))
             st.markdown("\n\n".join(lines))
             if not turn.persisted:
                 st.caption(f"DB {turn.db_error or 'ERROR'}")

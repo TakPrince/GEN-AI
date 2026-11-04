@@ -7,6 +7,16 @@ from safety_platform.evaluation.__main__ import build_parser
 _JBB_V2_FETCH_OUT = "evaluation/data/jbb-v2"
 
 
+def test_run_speculative_echo_flag_defaults_off_and_wires_true_on_flag() -> None:
+    parser = build_parser()
+
+    off = parser.parse_args(["run"])
+    assert off.speculative_echo is False
+
+    on = parser.parse_args(["run", "--speculative-echo"])
+    assert on.speculative_echo is True
+
+
 def test_build_parser_pins_jbb_v2_defaults(tmp_path, capsys):  # type: ignore[no-untyped-def]
     parser = build_parser()
 
