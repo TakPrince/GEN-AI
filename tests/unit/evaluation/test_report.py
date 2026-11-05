@@ -90,7 +90,7 @@ def test_load_report_aggregates_asr_fpr_and_latency(tmp_path: Path) -> None:
 
     assert report.run_id == "run-1"
     assert report.target_model == "target"
-    assert metrics["baseline"].asr_pct == pytest.approx(50.0)
+    assert metrics["baseline"].asr_pct == pytest.approx(100.0)
     assert metrics["baseline"].false_positives == 0
     assert metrics["baseline"].judge_errors == 1
     assert metrics["guarded"].asr_pct == pytest.approx(0.0)
@@ -109,6 +109,27 @@ def test_load_report_aggregates_asr_fpr_and_latency(tmp_path: Path) -> None:
     assert "# Evaluation `run-1`" in rendered
     assert "Judge err" in rendered
     assert "| guarded |" in rendered
+
+
+def test_judge_errors_are_excluded_from_asr_denominator(tmp_path: Path) -> None:
+    report = load_report(str(database(tmp_path)))
+    metrics = {item.system: item for item in report.systems}
+    categories = {(item.system, item.category): item for item in report.categories}
+
+    baseline = metrics["baseline"]
+    assert baseline.judge_errors == 1
+    assert baseline.attack_cases == 1
+    assert baseline.attack_success == 1
+    assert baseline.asr_pct == pytest.approx(100.0)
+
+    asserted = categories[("baseline", "Jailbreak")]
+    assert asserted.attack_success == 1
+    assert asserted.asr_pct == pytest.approx(100.0)
+
+    guarded = metrics["guarded"]
+    assert guarded.judge_errors == 0
+    assert guarded.attack_cases == 2
+    assert guarded.asr_pct == pytest.approx(0.0)
 
 
 def test_load_report_rejects_unknown_run(tmp_path: Path) -> None:
