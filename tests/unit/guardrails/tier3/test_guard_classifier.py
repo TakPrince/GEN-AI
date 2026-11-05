@@ -577,3 +577,10 @@ async def test_guard_classifier_rejects_invalid_tier2_verdict() -> None:
             context(),
             cast(SafetyVerdict, 1),
         )
+
+
+def test_json_object_parser_is_shared_with_evaluation() -> None:
+    from safety_platform.evaluation import llm
+    from safety_platform.guardrails.tier3 import guard_classifier
+
+    assert guard_classifier._json_object is llm._json_object

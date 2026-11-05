@@ -187,6 +187,13 @@ def test_judge_flags_offtopic_response_not_compliant() -> None:
     )
 
 
+def test_speculative_violating_status_is_public() -> None:
+    from safety_platform.evaluation import llm
+
+    assert llm.SPECULATIVE_VIOLATING == "violating"
+    assert not hasattr(llm, "_SPECULATIVE_VIOLATING")
+
+
 def test_client_post_wraps_network_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     def fail(*args: Any, **kwargs: Any) -> None:
         raise OSError("down")

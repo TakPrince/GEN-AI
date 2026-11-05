@@ -30,7 +30,7 @@ from safety_platform.config.registry import (
 )
 from safety_platform.evaluation.cascade import CascadeRuntime
 from safety_platform.evaluation.llm import (
-    _SPECULATIVE_VIOLATING,
+    SPECULATIVE_VIOLATING,
     OllamaClient,
     OllamaError,
     OllamaSpeculativeEchoProbe,
@@ -51,10 +51,10 @@ from safety_platform.guardrails.tier3.guard_classifier import GuardClassifier
 from safety_platform.middleware.regex_filter import RegexFilterMiddleware
 from safety_platform.middleware.vector_filter import VectorFilterMiddleware
 from safety_platform.research.ml_router import (
-    LogisticRegressionRouter,
     ModelDrivenRouter,
     RouterFeatures,
     Tier3BypassRouter,
+    benchmark_router,
 )
 from safety_platform.telemetry import AsyncTelemetryBus, TelemetryConsumer
 from safety_platform.telemetry.db_sink import SqliteTelemetrySink
@@ -222,11 +222,7 @@ def _pipeline(database: str) -> _Pipeline:
         _THRESHOLDS,
         _MARGINS,
     )
-    model = LogisticRegressionRouter(
-        weights=(1.5, 1.0, -0.3, 3.0, 0.2),
-        bias=-2.5,
-        threshold=0.50,
-    )
+    model = benchmark_router()
     guard = GuardClassifier(_LocalClassifier(), _THRESHOLDS)
     ml_router = ModelDrivenRouter(Tier3BypassRouter(model))
     router = ResponseRouter()
@@ -298,7 +294,7 @@ async def _evaluate(
     echo_status = "unavailable"
     if runtime.echo_probe is not None:
         echo_status = (await runtime.echo_probe.probe(prompt)).status
-        if echo_status == _SPECULATIVE_VIOLATING:
+        if echo_status == SPECULATIVE_VIOLATING:
             route = runtime.router.route(
                 context,
                 (

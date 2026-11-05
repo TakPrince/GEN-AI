@@ -21,14 +21,14 @@ from ..guardrails.tier1.regex_filter import RegexAction, RegexFilter, RegexRule
 from ..guardrails.tier2.vector_filter import Centroid, VectorFilter
 from ..guardrails.tier3.guard_classifier import GuardClassifier
 from ..research.ml_router import (
-    LogisticRegressionRouter,
     ModelDrivenRouter,
     RouterFeatures,
     Tier3BypassRouter,
+    benchmark_router,
 )
 from .dataset import EvaluationCase
 from .llm import (
-    _SPECULATIVE_VIOLATING,
+    SPECULATIVE_VIOLATING,
     OllamaEmbedder,
     SpeculativeEchoProbe,
 )
@@ -66,7 +66,7 @@ class CascadeRuntime:
         if probe is not None:
             echo = await probe.probe(text)
             echo_status = echo.status
-            if echo.status == _SPECULATIVE_VIOLATING:
+            if echo.status == SPECULATIVE_VIOLATING:
                 route = self.router.route(
                     context,
                     (
@@ -170,11 +170,7 @@ def build_cascade(
         max_input_bytes=16384,
     )
     vector = VectorFilter(embedder, centroids, active_thresholds, active_margins)
-    router_model = LogisticRegressionRouter(
-        weights=(1.5, 1.0, -0.3, 3.0, 0.2),
-        bias=-2.5,
-        threshold=0.50,
-    )
+    router_model = benchmark_router()
     return CascadeRuntime(
         regex=regex,
         vector=vector,

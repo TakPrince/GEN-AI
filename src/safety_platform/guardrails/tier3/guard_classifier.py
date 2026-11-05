@@ -17,6 +17,7 @@ from ...config.registry import (
     SafetyVerdict,
     TierGates,
 )
+from ...evaluation.llm import _json_object
 from .classifier import ClassifierClient, Tier3Classifier, Tier3Result
 
 _INSTRUCTION = (
@@ -282,20 +283,6 @@ def _violation_confidence(output: str) -> float:
     if isinstance(violation, bool):
         return 1.0 if violation else 0.0
     raise OllamaGuardError("malformed_verdict")
-
-
-def _json_object(text: str) -> dict[str, object] | None:
-    start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end < start:
-        return None
-    try:
-        payload = json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    return payload
 
 
 __all__ = [

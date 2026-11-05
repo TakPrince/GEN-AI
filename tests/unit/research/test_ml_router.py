@@ -9,7 +9,22 @@ from safety_platform.research.ml_router import (
     RouterFeatures,
     RouterSample,
     Tier3BypassRouter,
+    benchmark_router,
 )
+
+
+def test_benchmark_router_config_is_the_single_source() -> None:
+    model = benchmark_router()
+
+    assert model.weights == (1.5, 1.0, -0.3, 3.0, 0.2)
+    assert model.bias == -2.5
+    assert model.threshold == 0.5
+
+
+def test_model_driven_router_exposes_wrapped_base_router() -> None:
+    base = _distant_base()
+
+    assert ModelDrivenRouter(base).base is base
 
 
 def _distant_base() -> Tier3BypassRouter:

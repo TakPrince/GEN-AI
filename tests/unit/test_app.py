@@ -580,3 +580,18 @@ async def test_consumer_store_failure_is_reported(
     assert turn.db_error == "RuntimeError"
     assert store.stats.failures >= 1
     assert bus.size == 0
+
+
+def test_pipeline_router_matches_benchmark_router_config(
+    tmp_path: Path,
+) -> None:
+    from safety_platform import app
+    from safety_platform.research.ml_router import benchmark_router
+
+    pipeline = app._pipeline(str(tmp_path / "demo.sqlite3"))
+    benchmark = benchmark_router()
+    model = pipeline.ml_router.base.model
+
+    assert model.weights == benchmark.weights
+    assert model.bias == benchmark.bias
+    assert model.threshold == benchmark.threshold

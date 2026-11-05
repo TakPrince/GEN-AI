@@ -204,6 +204,10 @@ class Tier3BypassRouter:
             probability=probability,
         )
 
+    @property
+    def model(self) -> LogisticRegressionRouter:
+        return self._model
+
 
 class ModelDrivenRouter:
     """Hazard-boundary drift guard over the statistical bypass router.
@@ -229,6 +233,10 @@ class ModelDrivenRouter:
     def drift_floor(self) -> float:
         return self._drift_floor
 
+    @property
+    def base(self) -> Tier3BypassRouter:
+        return self._base
+
     def route(self, features: RouterFeatures) -> RouterDecision:
         if not isinstance(features, RouterFeatures):
             raise TypeError("features must be RouterFeatures")
@@ -246,6 +254,20 @@ def _sigmoid(value: float) -> float:
     return scaled / (1.0 + scaled)
 
 
+def benchmark_router() -> LogisticRegressionRouter:
+    """Calibrated bypass-router configuration used by the cascade and dashboard.
+
+    Single source of truth; provenance and decision record live in Readme §9
+    and docs/IMPLEMENTATION_PLAN_V2.md (Task 7 / F-HIGH-2). Do not copy the
+    literals elsewhere.
+    """
+    return LogisticRegressionRouter(
+        weights=(1.5, 1.0, -0.3, 3.0, 0.2),
+        bias=-2.5,
+        threshold=0.50,
+    )
+
+
 __all__ = [
     "LogisticRegressionRouter",
     "ModelDrivenRouter",
@@ -253,4 +275,5 @@ __all__ = [
     "RouterFeatures",
     "RouterSample",
     "Tier3BypassRouter",
+    "benchmark_router",
 ]

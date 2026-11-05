@@ -181,11 +181,11 @@ class OllamaEmbedder:
             self._cache[text] = vector
 
 
-_SPECULATIVE_VIOLATING = "violating"
+SPECULATIVE_VIOLATING = "violating"
 _SPECULATIVE_REFUSAL = "refusal_detected"
 _SPECULATIVE_UNCLEAR = "unclear"
 _SPECULATIVE_STATUSES = (
-    _SPECULATIVE_VIOLATING,
+    SPECULATIVE_VIOLATING,
     _SPECULATIVE_REFUSAL,
     _SPECULATIVE_UNCLEAR,
 )
@@ -223,7 +223,7 @@ _SPECULATIVE_VIOLATION_MARKERS = (
 def _speculative_status(tokens: str) -> str:
     lowered = tokens.casefold()
     if any(marker in lowered for marker in _SPECULATIVE_VIOLATION_MARKERS):
-        return _SPECULATIVE_VIOLATING
+        return SPECULATIVE_VIOLATING
     if any(marker in lowered for marker in _SPECULATIVE_REFUSAL_MARKERS):
         return _SPECULATIVE_REFUSAL
     return _SPECULATIVE_UNCLEAR
@@ -344,6 +344,7 @@ def _json_object(text: str) -> dict[str, object] | None:
 
 
 __all__ = [
+    "SPECULATIVE_VIOLATING",
     "ComplianceJudge",
     "JudgeResult",
     "OllamaClient",

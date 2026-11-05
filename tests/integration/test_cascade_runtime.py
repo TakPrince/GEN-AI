@@ -263,3 +263,12 @@ async def test_embedder_caches_repeated_prompts() -> None:
     await runtime.run("benign text", _context(Direction.INPUT))
 
     assert transport.batches == 2  # centroids once, "benign text" once, then cache
+
+
+def test_build_cascade_uses_benchmark_router_config() -> None:
+    runtime, _, _ = _runtime(ScriptedTier3({Direction.INPUT: 0.1}))
+    model = runtime.ml_router.base.model
+
+    assert model.weights == (1.5, 1.0, -0.3, 3.0, 0.2)
+    assert model.bias == -2.5
+    assert model.threshold == 0.5
