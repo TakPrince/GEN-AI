@@ -6,10 +6,9 @@ import json
 import math
 import os
 import re
-import time
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import cast
@@ -20,23 +19,27 @@ import streamlit as st
 from metrics.db_adapter import default_database_path, load_metrics
 from safety_platform.config.registry import (
     DEFAULT_CASCADE_THRESHOLDS,
-    Direction,
     ExecutionContext,
-    Route,
     RoutingMargins,
-    SafetyVerdict,
-    Stage,
     TelemetryEvent,
 )
 from safety_platform.evaluation.cascade import CascadeRuntime
 from safety_platform.evaluation.llm import (
-    SPECULATIVE_VIOLATING,
     OllamaClient,
     OllamaError,
     OllamaSpeculativeEchoProbe,
     SpeculativeEchoProbe,
 )
-from safety_platform.guardrails.router import ResponseRouter, StageDecision
+from safety_platform.execution import (
+    DefenseRequest,
+    execute_defense,
+    persist_telemetry,
+    stage_latency,
+    tier3_signal,
+    vector_signal,
+)
+from safety_platform.execution import _digest as _digest_imported
+from safety_platform.guardrails.router import ResponseRouter
 from safety_platform.guardrails.tier1.regex_filter import (
     RegexAction,
     RegexFilter,
@@ -45,19 +48,23 @@ from safety_platform.guardrails.tier1.regex_filter import (
 from safety_platform.guardrails.tier2.vector_filter import (
     Centroid,
     VectorFilter,
-    VectorFilterResult,
 )
 from safety_platform.guardrails.tier3.guard_classifier import GuardClassifier
-from safety_platform.middleware.regex_filter import RegexFilterMiddleware
-from safety_platform.middleware.vector_filter import VectorFilterMiddleware
 from safety_platform.research.ml_router import (
     ModelDrivenRouter,
-    RouterFeatures,
     Tier3BypassRouter,
     benchmark_router,
 )
 from safety_platform.telemetry import AsyncTelemetryBus, TelemetryConsumer
 from safety_platform.telemetry.db_sink import SqliteTelemetrySink
+
+# Test-facing aliases (tests/unit/test_app.py uses app._persist and friends).
+_persist = persist_telemetry
+_stage_latency = stage_latency
+_tier3_signal = tier3_signal
+_vector_signal = vector_signal
+_digest = _digest_imported
+_REFUSAL = "I cannot help with that request."
 
 _TOKEN = re.compile(r"[a-z0-9_'-]+")
 _THRESHOLDS = DEFAULT_CASCADE_THRESHOLDS
@@ -100,8 +107,6 @@ _STAGE_ICONS = {
     "SKIP": "⚡",
     "BYPASS": "⚡",
 }
-
-_REFUSAL = "I cannot help with that request."
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,269 +291,30 @@ async def _evaluate(
     prompt: str,
     context: ExecutionContext,
 ) -> _Turn:
-    collector = _Collector()
-    tier1 = RegexFilterMiddleware(runtime.regex, collector)
-    tier2 = VectorFilterMiddleware(runtime.vector, collector)
-    rows: list[_StageRow] = []
-
-    echo_status = "unavailable"
-    if runtime.echo_probe is not None:
-        echo_status = (await runtime.echo_probe.probe(prompt)).status
-        if echo_status == SPECULATIVE_VIOLATING:
-            route = runtime.router.route(
-                context,
-                (
-                    StageDecision(
-                        stage=Stage.ROUTER,
-                        verdict=SafetyVerdict.BLOCK,
-                        reason_codes=("speculative_echo:violating",),
-                    ),
-                ),
-            )
-            rows.append(_StageRow("ML", "SKIP", 0.0, echo_status))
-            persisted, db_error = await _persist(runtime, collector.events)
-            return _Turn(
-                prompt=prompt,
-                raw=_REFUSAL,
-                route=route.route.value,
-                stage=route.stage.value,
-                stages=tuple(rows),
-                router_probability=0.0,
-                tier3_invoked=False,
-                persisted=persisted,
-                speculative_echo_status=echo_status,
-                db_error=db_error,
-            )
-
-    first = await tier1(prompt, context)
-    rows.append(
-        _StageRow(
-            "TIER1",
-            first.verdict.value,
-            _stage_latency(collector.events, Stage.TIER1),
-            ",".join(first.rule_ids) or "-",
-        )
-    )
-    decisions = [
-        StageDecision(
-            stage=Stage.TIER1,
-            verdict=first.verdict,
-            reason_codes=first.rule_ids,
-            redacted_text=first.redacted_text,
-            error=first.error,
-        )
-    ]
-
-    if first.verdict in (SafetyVerdict.BLOCK, SafetyVerdict.ERROR):
-        route = runtime.router.route(context, decisions)
-        rows.append(_StageRow("ML", "SKIP", 0.0, "-"))
-        persisted, db_error = await _persist(runtime, collector.events)
-        return _Turn(
-            prompt=prompt,
-            raw=_REFUSAL,
-            route=route.route.value,
-            stage=route.stage.value,
-            stages=tuple(rows),
-            router_probability=0.0,
-            tier3_invoked=False,
-            persisted=persisted,
-            speculative_echo_status=echo_status,
-            db_error=db_error,
-        )
-
-    second = await tier2(prompt, context)
-    prompt_bytes = len(prompt.encode("utf-8", "surrogatepass"))
-    routing_drift_score = second.top_similarity
-    token_anomaly_score = min(1.0, prompt_bytes / 4096)
-    rows.append(
-        _StageRow(
-            "TIER2",
-            second.verdict.value,
-            _stage_latency(collector.events, Stage.TIER2),
-            _vector_signal(second),
-        )
-    )
-    decisions.append(
-        StageDecision(
-            stage=Stage.TIER2,
-            verdict=second.verdict,
-            reason_codes=(
-                (f"centroid:{second.top_centroid_id}",)
-                if second.top_centroid_id is not None
-                and second.verdict is not SafetyVerdict.PASS
-                else ()
-            ),
-            error=second.error,
-        )
-    )
-
-    decision = runtime.ml_router.route(
-        RouterFeatures(
-            regex_hit=bool(first.rule_ids),
-            top_similarity=second.top_similarity,
-            top_gap=second.top_gap,
-            tier2_ambiguous=second.verdict is SafetyVerdict.AMBIGUOUS,
-            prompt_bytes=prompt_bytes,
-        )
-    )
-    rows.append(
-        _StageRow(
-            "ML",
-            "TIER3" if decision.invoke_tier3 else "BYPASS",
-            0.0,
-            f"p={decision.probability:.3f}",
-        )
-    )
-
-    tier3_invoked = False
-    if second.verdict is SafetyVerdict.AMBIGUOUS and decision.invoke_tier3:
-        started = time.perf_counter_ns()
-        third = await runtime.guard.classify_if_ambiguous(
-            prompt,
-            context,
-            second.verdict,
-        )
-        latency_ms = max(0.0, (time.perf_counter_ns() - started) / 1_000_000)
-        if third is not None:
-            tier3_invoked = True
-            rows.append(
-                _StageRow(
-                    "TIER3",
-                    third.verdict.value,
-                    latency_ms,
-                    _tier3_signal(third.confidence, third.error),
-                )
-            )
-            decisions.append(
-                StageDecision(
-                    stage=Stage.TIER3,
-                    verdict=third.verdict,
-                    reason_codes=third.reason_codes,
-                    error=third.error,
-                )
-            )
-            collector.emit_nowait(
-                TelemetryEvent(
-                    event_id=uuid.uuid4().hex,
-                    context=context,
-                    stage=Stage.TIER3,
-                    verdict=third.verdict,
-                    latency_ms=latency_ms,
-                    prompt_hash=_digest(prompt),
-                    timestamp_ns=time.time_ns(),
-                    rule_ids=third.reason_codes,
-                    error=third.error,
-                )
-            )
-
-    route = runtime.router.route(context, decisions)
-    if route.route in (Route.REFUSED, Route.ERROR):
-        persisted, db_error = await _persist(runtime, collector.events)
-        return _Turn(
-            prompt=prompt,
-            raw=_REFUSAL,
-            route=route.route.value,
-            stage=route.stage.value,
-            stages=tuple(rows),
-            router_probability=decision.probability,
-            tier3_invoked=tier3_invoked,
-            persisted=persisted,
-            speculative_echo_status=echo_status,
-            db_error=db_error,
-        )
-
-    completion_prompt = route.safe_text or prompt
-    raw = await asyncio.to_thread(_live_completion, completion_prompt)
-
-    output_context = replace(
+    result = await execute_defense(
+        runtime,
+        DefenseRequest(prompt=prompt, request_id=uuid.uuid4().hex),
         context,
-        direction=Direction.OUTPUT,
-        user_input=prompt,
+        completion=_live_completion,
     )
-    output = await runtime.cascade.run(raw, output_context)
-    rows.append(
-        _StageRow(
-            "OGUARD",
-            output.verdict,
-            output.latency_ms,
-            f"tier:{output.stage}",
-        )
+    stages = tuple(
+        _StageRow(row.stage, row.verdict, row.latency_ms, row.signal)
+        for row in result.stage_observations
     )
-
-    displayed = raw
-    final_route = route.route.value
-    final_stage = route.stage.value
-    if output.route in ("refused", "error"):
-        displayed = _REFUSAL
-        final_route = output.route
-        final_stage = output.stage
-    elif output.route == Route.PARTIAL.value:
-        redaction = runtime.regex.evaluate(raw)
-        displayed = redaction.redacted_text or raw
-        final_route = output.route
-        final_stage = output.stage
-
-    persisted, db_error = await _persist(runtime, collector.events)
     return _Turn(
         prompt=prompt,
-        raw=displayed,
-        route=final_route,
-        stage=final_stage,
-        stages=tuple(rows),
-        router_probability=decision.probability,
-        tier3_invoked=tier3_invoked or output.tier3_invoked,
-        persisted=persisted,
-        routing_drift_score=routing_drift_score,
-        token_anomaly_score=token_anomaly_score,
-        speculative_echo_status=echo_status,
-        db_error=db_error,
+        raw=result.final_response,
+        route=result.final_route,
+        stage=result.final_stage,
+        stages=stages,
+        router_probability=result.router_probability,
+        tier3_invoked=result.tier3_invoked,
+        persisted=result.telemetry_persisted,
+        routing_drift_score=result.routing_drift_score,
+        token_anomaly_score=result.token_anomaly_score,
+        speculative_echo_status=result.speculative_echo_status,
+        db_error=result.telemetry_error,
     )
-
-
-async def _persist(
-    runtime: _Pipeline,
-    events: Sequence[TelemetryEvent],
-) -> tuple[bool, str | None]:
-    if not events:
-        return True, None
-    dropped = sum(1 for event in events if not runtime.bus.emit_nowait(event))
-    # With Streamlit spawning a fresh event loop per turn, the consumer is drained
-    # on the turn's own loop instead of a persistent background task.
-    stop = asyncio.Event()
-    stop.set()
-    try:
-        written = await runtime.consumer.run(stop=stop)
-    except Exception as exc:
-        return False, type(exc).__name__
-    if dropped:
-        return False, "queue_full"
-    if written < len(events) - dropped:
-        return False, runtime.consumer.stats.last_error or "consumer_failure"
-    return True, None
-
-
-def _stage_latency(events: Sequence[TelemetryEvent], stage: Stage) -> float:
-    for event in reversed(events):
-        if event.stage is stage:
-            return event.latency_ms
-    return 0.0
-
-
-def _vector_signal(result: VectorFilterResult) -> str:
-    centroid = result.top_centroid_id or "-"
-    return f"{centroid} {result.top_similarity:.2f}/{result.top_gap:.2f}"
-
-
-def _tier3_signal(confidence: float | None, error: str | None) -> str:
-    if error is not None:
-        return error
-    if confidence is None:
-        return "-"
-    return f"conf={confidence:.3f}"
-
-
-def _digest(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def _raw_completion(prompt: str) -> str:

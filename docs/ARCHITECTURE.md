@@ -42,6 +42,46 @@ sequenceDiagram
 
 ## Three-Tier Cascade
 
+### Unified Defense Interface (implemented: `src/safety_platform/execution.py`)
+
+`execute_defense(runtime, defense_request, execution_context, *, completion)` is the
+one execution boundary all callers share (dashboard today; red-team engine and
+future harnesses next). It owns the whole defended execution: speculative echo
+probe → Tier 1 → Tier 2 → ML router → optional Tier 3 → safety routing → the
+injected target completion → output guard, and it drains the telemetry bus
+before returning:
+
+- The completion callable is required. There is no code path — and no exported
+  symbol — that produces a completion without running the input guards, so a
+  red-team caller cannot bypass the pipeline; blocked requests make zero target
+  calls and return `target_status="skipped"`, `raw_response=None`.
+- `DefenseRequest` carries `prompt`, `request_id`, optional `attack_id` /
+  `attack_category` and metadata; these are echoed into `DefenseResult` so a
+  red-team caller can correlate attacks with outcomes (Task 9/10 hook).
+- `DefenseResult` is the shared result contract (`DEFENSE_RESULT_CONTRACT`
+  lists its field names): request identity (`request_id`, `trace_id`,
+  `prompt`, `metadata`), defense decisions (`input_route`, `input_stage`,
+  `decisions`, `router_probability`, `tier3_invoked`), target execution
+  (`target_status`, `raw_response`), output guard (`output_guard_route`,
+  `output_guard_stage`, `output_guard_latency_ms`), final disposition
+  (`final_route`, `final_stage`, `final_response`), evaluation hooks
+  (`outcome`, `blocked`, `attack_id`, `attack_category`), and operational
+  data (`latency_ms`, `stage_observations`, `error`, `failure_stage`,
+  `telemetry_persisted`, `speculative_echo_status`, drift scores).
+- Outcome semantics: `outcome ∈ {safe, partial, blocked, error}` follows
+  `final_route`. Target failures raise `failure_stage="target"` with
+  `raw_response=None` and are never reported as a defense (`blocked=False`,
+  `outcome="error"`); guardrail failures name their stage (e.g.
+  `failure_stage="tier2"`); telemetry failures are reported separately via
+  `telemetry_persisted/telemetry_error` and never alter a verdict.
+- The dashboard (`app._evaluate`) is now a thin adapter translating a
+  `DefenseResult` into `_Turn`; behavior is unchanged and covered by the
+  existing dashboard tests. The evaluation runner keeps its own batch
+  pipeline; migrating it onto this boundary is deferred to a later task.
+- Target backend injection: the caller provides the completion function
+  (dashboard: `app._live_completion`; red-team engine: its own `OllamaClient`
+  call or test stub), keeping the boundary free of any specific transport.
+
 One orchestration contract; separate input/output profiles and thresholds.
 
 | Tier | Detector | Verdicts | Escalation |
