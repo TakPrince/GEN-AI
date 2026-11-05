@@ -10,6 +10,7 @@ from pathlib import Path
 from .dataset import fetch_jbb_dataset
 from .report import EvaluationReport, load_report, render_markdown
 from .runner import RunConfig, run_evaluation
+from .tier3_calibration import PILOT_RUN_ID
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -66,6 +67,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report.add_argument("--run-id")
     report.add_argument("--json", type=Path)
+
+    calibrate = commands.add_parser("calibrate")
+    calibrate.add_argument(
+        "--db",
+        type=Path,
+        default=Path("evaluation/results/jbb-v2.sqlite3"),
+    )
+    calibrate.add_argument("--run-id", default=None)
+    calibrate.add_argument("--system", default="baseline")
+    calibrate.add_argument(
+        "--dataset",
+        type=Path,
+        default=Path("evaluation/data/jbb-v2/cases.jsonl"),
+    )
+    calibrate.add_argument("--tier3", default="qwen3:8b")
+    calibrate.add_argument(
+        "--out",
+        type=Path,
+        default=Path("evaluation/calibration/tier3-arbitration.json"),
+    )
     return parser
 
 
@@ -101,6 +122,41 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(render_markdown(active))
         if arguments.report_json is not None:
             _write_json(active, arguments.report_json)
+        return
+    if arguments.command == "calibrate":
+        from ..guardrails.tier3.guard_classifier import OllamaGuardConfig
+        from .tier3_calibration import (
+            build_artifact,
+            decide,
+            load_stored_responses,
+            score_stored_responses,
+            sweep,
+        )
+
+        responses = load_stored_responses(
+            arguments.db,
+            arguments.run_id or PILOT_RUN_ID,
+            arguments.dataset,
+            system=arguments.system,
+        )
+        scored = score_stored_responses(
+            responses,
+            OllamaGuardConfig(model=arguments.tier3, timeout_s=120.0),
+        )
+        entries = sweep(scored)
+        decision = decide(entries)
+        artifact = build_artifact(
+            arguments.run_id or PILOT_RUN_ID,
+            arguments.system,
+            scored,
+            entries,
+            decision,
+        )
+        arguments.out.parent.mkdir(parents=True, exist_ok=True)
+        arguments.out.write_text(
+            json.dumps(artifact, indent=2) + "\n", encoding="utf-8"
+        )
+        print(json.dumps(artifact["decision"]))
         return
     active = load_report(str(arguments.db), run_id=arguments.run_id)
     print(render_markdown(active))
