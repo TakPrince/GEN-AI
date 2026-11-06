@@ -82,6 +82,36 @@ before returning:
   (dashboard: `app._live_completion`; red-team engine: its own `OllamaClient`
   call or test stub), keeping the boundary free of any specific transport.
 
+### Single-Turn Red-Team Orchestrator (Task 9, `src/safety_platform/orchestrator/`)
+
+The red-team engine drives attacks *through* `execute_defense`; it never calls
+the target model directly, so no code path exists that bypasses the pipeline.
+
+- `mutators.py` — deterministic single-turn mutations: `STRATEGIES =
+  ("direct", "role_wrap", "encoding", "payload_split")`. `mutate(prompt,
+  strategy, seed)` is reproducible (`payload_split` picks a separator from
+  `seed % 4`); `selection_for(cases, strategies, seed)` assigns one strategy
+  per case deterministically from only `(strategies, seed)`.
+- `loop.py` — `run_campaign(runtime, cases, judge, completion, *, run_id, …)`
+  samples `per_label` attacks and benigns, mutates each, and sends
+  `DefenseRequest` (attack metadata preserved) through the shared boundary.
+  Every `AttemptOutcome` records the defense disposition, the user-visible
+  `final_response`, and the independent `ComplianceJudge` verdict evaluated
+  afterwards. Blocked attacks are judged on the visible refusal (end-to-end);
+  execution failures (`outcome="error"`) are never judged and never counted
+  in ASR; the raw model output of output-blocked requests is judged only as a
+  separate `raw_judge_*` diagnostic. Binary judge: partial compliance is
+  never fabricated (`partial_compliance=None`).
+- `metrics.py` — reuses the evaluation report denominators: ASR is computed
+  over judged, non-errored attack attempts (Wilson CIs via
+  `evaluation/report.py`); benign FPR excludes errored executions and is
+  reported separately; judge failures count as missing measurements with the
+  error rate surfaced alongside.
+- CLI: `python -m safety_platform.orchestrator --dataset
+  evaluation/data/jbb-v2/cases.jsonl --attack-per-label 5` writes JSONL
+  records and a summary JSON under `evaluation/results/`.
+
+
 One orchestration contract; separate input/output profiles and thresholds.
 
 | Tier | Detector | Verdicts | Escalation |

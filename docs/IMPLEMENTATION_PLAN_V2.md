@@ -70,6 +70,9 @@ Basis: `docs/BASELINE_AUDIT.md`. Read-only findings converted into ordered, veri
 - **Deps:** Task 5 (retry), Task 7 (dedup) optional. **Size:** M.
 
 ### Checkpoint B
+- Judge hardened; calibration decision recorded; weights single-sourced.
+
+
 - [ ] Judge hardened; calibration decision recorded; weights single-sourced.
 
 ## Phase C — Missing capability (the offense half)
@@ -80,8 +83,21 @@ Basis: `docs/BASELINE_AUDIT.md`. Read-only findings converted into ordered, veri
 - **Verification:** `pytest tests/unit/orchestrator -q`; smoke run against live Ollama with 2 cases.
 - **Files:** new `orchestrator/{__init__,mutators,loop}.py`, `tests/unit/orchestrator/*`.
 - **Deps:** Tasks 1-8 (uses cascade + hardened judge). **Size:** M.
-
-### Task 10: Multi-turn state + partial-compliance metric
+- **Status (Task 9):** COMPLETE.
+  - `orchestrator.{mutators,loop,metrics}` + `__main__.py` under
+    `src/safety_platform/orchestrator/`; unit tests
+    `tests/unit/orchestrator/{test_mutators,test_loop,test_metrics}.py`
+    (24 tests, all green).
+  - Loop runs every attempt through `execute_defense` (no target bypass);
+    outcomes/judge/failures recorded per plan; independent `ComplianceJudge`
+    on user-visible responses; blocked attacks judged end-to-end; raw-output
+    judging kept separate as `raw_judge_*` diagnostics; ASR/Wilson/FPR/latency
+    denominators reuse `evaluation/report.py` helpers; partial compliance
+    explicitly never fabricated.
+  - CLI + documented options in `docs/ARCHITECTURE.md` ("Single-Turn
+    Red-Team Orchestrator"); smoke run executed against live Ollama
+    (`evaluation/results/redteam-singleturn-*.jsonl` + summaries).
+  - Deferred to Task 10: partial-compliance metric + multi-turn escalation. Multi-turn state + partial-compliance metric
 **Description:** Add `AttackState` (turn history, prior verdicts) to the orchestrator and a crescendo/escalation mutator that reads prior-blocked verdicts (spec §3 component 9, feedback). Add partial-compliance counting across turns.
 - **Acceptance:** a scripted multi-turn fixture (stub target) shows escalation reacts to blocked-turn verdicts; partial metric computed in summary.
 - **Verification:** `pytest tests/unit/orchestrator -q`.
