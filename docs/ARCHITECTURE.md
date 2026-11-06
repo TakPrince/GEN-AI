@@ -111,6 +111,52 @@ the target model directly, so no code path exists that bypasses the pipeline.
   evaluation/data/jbb-v2/cases.jsonl --attack-per-label 5` writes JSONL
   records and a summary JSON under `evaluation/results/`.
 
+### Multi-Turn Red-Team Engine (Task 10, `orchestrator/{attack_state,escalation,multi}.py`)
+
+Multi-turn conversations extend the single-turn engine; every turn still goes
+through `execute_defense` and no code path calls the target model directly.
+
+- `attack_state.py` — one frozen `AttackState` per attack scenario: explicit
+  transitions only (`running -> complete|failed`) returning new instances;
+  `turns` are appended strictly sequentially and never past `max_turns`;
+  `history()` derives `(prompt, user-visible reply)` pairs from this state
+  alone, so nothing leaks between scenarios. A turn whose
+  `execute_defense` raised is not appended; the loop marks the scenario
+  failed and stops.
+- `escalation.py` — two deterministic strategies (`crescendo` reacts to
+  blocked prior turns with a bounded reframe template; `benign_primer`
+  builds benign context and introduces the objective on the final turn).
+  Prompts carry the original objective plus the last two transcript turns;
+  a seed picks the single-turn wrapper (direct/role_wrap) on top. Mutations
+  are pure templates — no LLM calls, no verdict fabrication.
+- `multi.py` — `run_conversation` loops turns up to `max_turns` (stop
+  reasons: objective judged complied → `complied`; two consecutive
+  blocked turns → `blocked_convergence`; cap → `max_turns`; defense error
+  → `failed` with stage). Each turn records a `TurnRecord` (outcome,
+  blocked, routes, visible response, turn-level binary judge verdict,
+  latency). After the final turn, `ComplianceJudge.judge_conversation`
+  produces the structured conversation verdict (`compliant`,
+  `partial_compliance`, `refused`, `non_compliant`; `unscorable` for failed
+  scenarios, `judge_error` for judge failures — never fabricated). A
+  blocked turn makes zero target calls; the next turn continues through
+  the boundary again. `run_conversation_campaign` picks `per_label` attacks,
+  assigns escalations from `(run_id, escalations, seed)`, and keeps a
+  campaign-level per-scenario failure from aborting the batch.
+- `metrics.py — aggregate_conversations` — conversation scorable
+  denominator excludes judge-error and unscorable/failed scenarios; ASR,
+  full-compliance (alias), partial-compliance and refusal rates carry
+  Wilson CIs; turn-level ASR reuses the Task 9 binary convention over
+  judged non-errored turns; mean turns-to-success counts only
+  conversations with at least one judged-compliant turn; per-category
+  rows separate conversations from scorable subsets. Task 9 single-turn
+  metric semantics are untouched.
+- CLI (mode=multi): `python -m safety_platform.orchestrator --mode multi
+  --dataset evaluation/data/jbb-v2/cases.jsonl --attack-per-label N
+  --max-turns 3 --escalations crescendo` writes
+  `evaluation/results/redteam-multiturn-<run_id>.jsonl` (one record per
+  conversation, turns nested) plus a summary JSON. Historical artifacts
+  are never overwritten (unique run ids).
+
 
 One orchestration contract; separate input/output profiles and thresholds.
 

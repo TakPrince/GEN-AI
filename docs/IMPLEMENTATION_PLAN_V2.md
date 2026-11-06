@@ -97,12 +97,34 @@ Basis: `docs/BASELINE_AUDIT.md`. Read-only findings converted into ordered, veri
   - CLI + documented options in `docs/ARCHITECTURE.md` ("Single-Turn
     Red-Team Orchestrator"); smoke run executed against live Ollama
     (`evaluation/results/redteam-singleturn-*.jsonl` + summaries).
-  - Deferred to Task 10: partial-compliance metric + multi-turn escalation. Multi-turn state + partial-compliance metric
+  - Deferred to Task 10: partial-compliance metric + multi-turn escalation.
+
+### Task 10: Multi-turn state + partial-compliance metric (F-HIGH-1 b: conversation campaign)
 **Description:** Add `AttackState` (turn history, prior verdicts) to the orchestrator and a crescendo/escalation mutator that reads prior-blocked verdicts (spec §3 component 9, feedback). Add partial-compliance counting across turns.
 - **Acceptance:** a scripted multi-turn fixture (stub target) shows escalation reacts to blocked-turn verdicts; partial metric computed in summary.
 - **Verification:** `pytest tests/unit/orchestrator -q`.
 - **Files:** `src/safety_platform/orchestrator/{loop,attack_state}.py`, test files.
 - **Deps:** Task 9. **Size:** M.
+- **Status (Task 10):** COMPLETE.
+  - `orchestrator.attack_state` (frozen AttackState/TurnRecord, explicit
+    transitions, max-turns enforcement, failed-turn isolation), `orchestrator.
+    escalation` (crescendo reacts to blocked-turn history; benign_primer), and
+    `orchestrator.multi` (run_conversation + campaign; every turn through
+    `execute_defense`; early-stop on complied/block-convergence; per-turn
+    binary + conversation-level structured verdicts from the SAME
+    ComplianceJudge via new `judge_conversation`).
+  - Partial compliance: `ComplianceVerdict` (compliant, partial_compliance,
+    refused, non_compliant, unscorable, judge_error) mapped from judge JSON in
+    `evaluation/llm.py`; never fabricated from binary labels; UNSCORABLE on
+    failed scenarios; injection hardening reused.
+  - Conversation metrics: ASR/full/partial/refusal with Wilson CIs,
+    turn-level ASR, avg turns-to-success, latency totals, judge-error rates,
+    category rows — denominators exclude judge errors and failed scenarios.
+  - CLI `--mode multi`; JSONL + summary artifacts unique per run.
+  - Tests: `tests/unit/orchestrator/test_{escalation,attack_state,multi,
+    conversation_metrics}.py` + `tests/unit/evaluation/
+    test_conversation_judge.py` (35 tests) all green; live 1-conversation
+    smoke exercised real OllamaError paths (verdict judge_error, excluded).
 
 ### Task 11 (F-MED-3): Makefile hygiene
 **Description:** Point `make eval-smoke` at a disposable DB (`evaluation/results/smoke.sqlite3`); align `pytest.ini` vs `pyproject` F-MED-7 (keep pytest.ini: it is what CI uses); add a roadmap refresh of `tasks/todo.md` (or replace content) to reflect the audit plan rather than the abandoned ASGI roadmap.

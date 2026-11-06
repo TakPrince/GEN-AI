@@ -24,7 +24,7 @@ from .mutators import STRATEGIES
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="safety_platform.orchestrator",
-        description="Single-turn red-team orchestration harness",
+        description="Red-team orchestration harness (single- and multi-turn)",
     )
     parser.add_argument(
         "--dataset",
@@ -53,7 +53,77 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="telemetry sqlite path (defaults to a temp file outside the repo)",
     )
+    parser.add_argument(
+        "--mode",
+        default="single",
+        choices=("single", "multi"),
+        help="single: Task 9 campaigns; multi: Task 10 conversation campaigns",
+    )
+    parser.add_argument(
+        "--escalations",
+        default="crescendo",
+        help="comma-separated multi-turn escalation strategies (mode=multi)",
+    )
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=3,
+        help="per-conversation turn cap (mode=multi)",
+    )
     return parser
+
+
+async def _run_multi(args, cases) -> int:
+    from .escalation import ESCALATIONS
+    from .multi import (
+        _CampaignRuntime,  # noqa: F401  (runtime protocol)
+        run_conversation_campaign,
+        write_conversations_jsonl,
+    )
+
+    escalations = tuple(s.strip() for s in args.escalations.split(",") if s.strip())
+    for escalation in escalations:
+        if escalation not in ESCALATIONS:
+            _parser().error(f"unknown escalation {escalation!r}")
+    dataset_name = Path(args.dataset).parent.name
+    runtime = _pipeline(
+        str(Path(args.db or (f"{Path(tempfile_prefix())}-redteam.sqlite3")))
+    )
+    judge = ComplianceJudge(OllamaClient(args.judge_model))
+    records, summary = await run_conversation_campaign(
+        runtime,
+        cases,
+        judge,
+        _live_completion,
+        run_id=_run_stamp(),
+        per_label=args.attack_per_label,
+        max_turns=args.max_turns,
+        escalations=escalations,
+        seed=args.seed,
+        model_metadata=(
+            ("target", "qwen3:8b"),
+            ("judge", args.judge_model),
+            ("dataset", dataset_name),
+            ("mode", "multi"),
+        ),
+    )
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    jsonl_path = out_dir / f"redteam-multiturn-{summary['run_id']}.jsonl"
+    summary_path = out_dir / f"redteam-multiturn-{summary['run_id']}-summary.json"
+    write_conversations_jsonl(records, jsonl_path)
+    write_summary(summary, summary_path)
+    conversation_metrics = summary["conversation_metrics"]
+    totals = summary["totals"]
+    print(
+        f"conversations {totals['conversations']}, scorable {totals['scorable']}: "
+        f"ASR {conversation_metrics['asr_pct']}% "
+        f"partial {conversation_metrics['partial_compliance_pct']}%, "
+        f"turn-ASR {summary['turn_metrics']['asr_pct']}%"
+    )
+    print(f"records: {jsonl_path}")
+    print(f"summary: {summary_path}")
+    return 0
 
 
 async def main(argv: list[str] | None = None) -> int:
@@ -65,6 +135,9 @@ async def main(argv: list[str] | None = None) -> int:
             parser.error(f"unknown strategy {strategy!r}")
 
     cases = tuple(load_cases(Path(args.dataset)))
+    if args.mode == "multi":
+        return await _run_multi(args, cases)
+
     attacks = sum(1 for case in cases if case.label == "attack")
     benign_cases = len(cases) - attacks
     print(
