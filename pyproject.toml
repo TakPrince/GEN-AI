@@ -17,8 +17,8 @@ classifiers = [
     "Topic :: Security",
     "Typing :: Typed",
 ]
+# All Ollama traffic uses stdlib urllib (evaluation/llm.py); no client SDK.
 dependencies = [
-    "ollama>=0.6,<1",
     "streamlit>=1.51,<2",
 ]
 
@@ -36,10 +36,6 @@ ui = ["streamlit>=1.51,<2"]
 [tool.setuptools.packages.find]
 where = ["src", "."]
 include = ["safety_platform*", "metrics*"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-asyncio_mode = "strict"
 
 [tool.coverage.run]
 source = ["safety_platform"]

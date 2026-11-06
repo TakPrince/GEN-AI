@@ -24,8 +24,9 @@ app:
 eval-data:
 	PYTHONPATH=src:. $(PYTHON) -m safety_platform.evaluation fetch --out evaluation/data/jbb-v2
 
+# smoke runs must never pollute the pilot DB's "latest completed run"
 eval-smoke:
-	PYTHONPATH=src:. $(PYTHON) -m safety_platform.evaluation run --dataset evaluation/data/jbb-v2/cases.jsonl --db evaluation/results/jbb-v2.sqlite3 --per-label 2
+	PYTHONPATH=src:. $(PYTHON) -m safety_platform.evaluation run --dataset evaluation/data/jbb-v2/cases.jsonl --db evaluation/results/smoke.sqlite3 --per-label 2
 
 eval:
 	PYTHONPATH=src:. $(PYTHON) -m safety_platform.evaluation run --dataset evaluation/data/jbb-v2/cases.jsonl --db evaluation/results/jbb-v2.sqlite3 --per-label 30 --report-json evaluation/results/jbb-v2.json

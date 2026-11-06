@@ -131,7 +131,17 @@ Basis: `docs/BASELINE_AUDIT.md`. Read-only findings converted into ordered, veri
 - **Acceptance:** running `make eval-smoke` cannot pollute the pilot DB's "latest completed run"; todo matches this plan.
 - **Verification:** grep Makefile; run `make eval-smoke` with Ollama optional (skips gracefully) then `make report` still shows the pilot.
 - **Files:** `Makefile`, `pytest.ini`, `tasks/todo.md`.
-- **Deps:** Task 2. **Size:** XS.
+- **Status (Task 11):** COMPLETE.
+  - `make eval-smoke` now uses disposable `evaluation/results/smoke.sqlite3`.
+  - Pytest config consolidated into `pytest.ini` (`asyncio_mode = strict`
+    moved there; ignored `[tool.pytest.ini_options]` removed from pyproject).
+  - Unused `ollama` SDK dependency removed (all traffic uses stdlib urllib in
+    `evaluation/llm.py`); runtime deps now just `streamlit`.
+  - Readme §9 status refreshed (Tasks 9–11 implemented); `tasks/todo.md`
+    replaced with the plan-mirror + outstanding recommendations; SQLite
+    untracking documented as an approval-gated action (Task 2 pending).
+  - Verification: full `pytest -q` (337), `make lint` clean; `make eval-smoke`
+    NOT executed live (avoids model churn — behaviour change is config-only).
 
 ### Checkpoint C
 - [ ] Orchestrator runs single-turn and multi-turn attacks end-to-end against Ollama; ASR summary per mutator.
