@@ -22,3 +22,8 @@ metrics/telemetry.sqlite3*
 # SQLite sidecar files
 *.sqlite3-wal
 *.sqlite3-shm
+
+# Local databases (untracked in beafc41; keep off the work tree)
+metrics/*.sqlite3
+evaluation/results/*.sqlite3
+
