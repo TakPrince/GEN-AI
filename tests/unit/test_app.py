@@ -140,7 +140,6 @@ def test_app_signal_helpers() -> None:
     assert app._tier3_signal(0.8, None) == "conf=0.800"
     assert app._tier3_signal(None, None) == "-"
     assert app._tier3_signal(None, "boom") == "boom"
-    assert app._raw_completion("hello") == "hello"
     assert len(app._digest("hello")) == 64
     assert app._HashingEmbedder(4).embed("") == (1.0, 0.0, 0.0, 0.0)
 

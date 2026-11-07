@@ -68,6 +68,14 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--run-id")
     report.add_argument("--json", type=Path)
 
+    replay = commands.add_parser("replay")
+    replay.add_argument("dead_letter", type=Path)
+    replay.add_argument(
+        "--db",
+        type=Path,
+        default=Path("evaluation/results/jbb-v2.sqlite3"),
+    )
+
     calibrate = commands.add_parser("calibrate")
     calibrate.add_argument(
         "--db",
@@ -123,6 +131,28 @@ def main(argv: Sequence[str] | None = None) -> None:
         if arguments.report_json is not None:
             _write_json(active, arguments.report_json)
         return
+    if arguments.command == "replay":
+        from ..telemetry.db_sink import SqliteTelemetrySink
+        from ..telemetry.replay import replay_dead_letter
+
+        if not arguments.dead_letter.is_file():
+            raise SystemExit(2)
+        report = replay_dead_letter(
+            SqliteTelemetrySink(str(arguments.db)),
+            arguments.dead_letter,
+        )
+        print(
+            f"replay read={report.records_read} recovered={report.events_recovered}"
+            f" duplicated={report.events_duplicated}"
+            f" malformed={report.malformed_records}"
+            f" invalid={report.invalid_records} failed={report.events_failed}"
+        )
+        for failure in report.failures:
+            print(f"  line {failure.line_no}: {failure.error}: {failure.detail}")
+        if report.malformed_records or report.invalid_records or report.events_failed:
+            raise SystemExit(1)
+        return
+
     if arguments.command == "calibrate":
         from ..guardrails.tier3.guard_classifier import OllamaGuardConfig
         from .tier3_calibration import (

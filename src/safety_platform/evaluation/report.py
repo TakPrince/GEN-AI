@@ -39,6 +39,7 @@ class CategoryMetrics:
 @dataclass(frozen=True, slots=True)
 class EvaluationReport:
     run_id: str
+    completed: bool
     target_model: str
     dataset_digest: str
     systems: tuple[SystemMetrics, ...]
@@ -54,7 +55,8 @@ def load_report(
     try:
         resolved = _resolve_run(connection, run_id)
         meta = connection.execute(
-            "SELECT target_model, dataset_digest FROM run WHERE run_id = ?",
+            "SELECT target_model, dataset_digest, completed_ns"
+            " FROM run WHERE run_id = ?",
             (resolved,),
         ).fetchone()
         if meta is None:
@@ -68,6 +70,9 @@ def load_report(
         connection.close()
     return EvaluationReport(
         run_id=resolved,
+        # A run whose completion timestamp was never committed was
+        # interrupted; its metrics still come only from durable rows.
+        completed=meta[2] is not None,
         target_model=str(meta[0]),
         dataset_digest=str(meta[1]),
         systems=systems,
@@ -125,7 +130,13 @@ def render_markdown(report: EvaluationReport) -> str:
 
 def _resolve_run(connection: sqlite3.Connection, run_id: str | None) -> str:
     if run_id is not None:
-        return run_id
+        # An explicitly requested run may be interrupted; recovery wants it.
+        row = connection.execute(
+            "SELECT run_id FROM run WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown run_id: {run_id}")
+        return str(row[0])
     row = connection.execute(
         """
         SELECT run_id FROM run
@@ -135,7 +146,13 @@ def _resolve_run(connection: sqlite3.Connection, run_id: str | None) -> str:
         """
     ).fetchone()
     if row is None:
-        raise ValueError("evaluation database contains no completed runs")
+        # Prefer completed runs, but an interrupted one is still the
+        # recoverable last run of the campaign.
+        row = connection.execute(
+            "SELECT run_id FROM run ORDER BY started_ns DESC LIMIT 1"
+        ).fetchone()
+    if row is None:
+        raise ValueError("evaluation database contains no runs")
     return str(row[0])
 
 

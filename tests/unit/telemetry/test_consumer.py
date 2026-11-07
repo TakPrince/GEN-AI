@@ -82,9 +82,12 @@ async def test_consumer_records_failure_and_continues() -> None:
 
     written = await consumer.stop()
 
-    assert written == 1
+    # Task 12: one transient failure is retried, so both events are saved;
+    # the failure is still visible in stats and the on_error hook.
+    assert written == 2
     assert errors == ["RuntimeError"]
     assert consumer.stats.failures == 1
+    assert consumer.stats.batches_retried == 1
     assert consumer.stats.last_error == "RuntimeError"
 
 

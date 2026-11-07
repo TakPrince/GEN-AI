@@ -125,12 +125,17 @@ async def run_conversation(
     seed: int = 0,
     model_metadata: tuple[tuple[str, str], ...] = (),
     reference_time: str | None = None,
+    resume_state: AttackState | None = None,
+    on_turn_start: Callable[[int], None] | None = None,
+    on_turn_done: Callable[[AttackState], None] | None = None,
 ) -> ScenarioOutcome:
+    """`resume_state` continues a persisted conversation; the hooks let a
+    durable store checkpoint each turn (Task 15)."""
     if escalation not in ESCALATIONS:
         raise ValueError(f"unknown escalation strategy: {escalation!r}")
     timestamp = reference_time or datetime.now(UTC).isoformat()
     conversation_id = f"{run_id}-{case.case_id}"
-    state = AttackState(
+    state = resume_state or AttackState(
         run_id=run_id,
         conversation_id=conversation_id,
         case_id=case.case_id,
@@ -139,8 +144,20 @@ async def run_conversation(
         max_turns=max_turns,
         escalation=escalation,
     )
-    total_latency = 0.0
+    total_latency = sum(turn.latency_ms for turn in state.turns)
     consecutive_blocks = 0
+    for turn_record in reversed(state.turns):  # trailing blocks, as the loop counts
+        if not turn_record.blocked:
+            break
+        consecutive_blocks += 1
+    if state.status == "failed":
+        return _finalize(state, escalation, timestamp, model_metadata, total_latency)
+
+    def checkpoint(current: AttackState) -> AttackState:
+        if on_turn_done is not None:
+            on_turn_done(current)
+        return current
+
     while state.status == "running" and state.turn_count < state.max_turns:
         turn = state.turn_count + 1
         prompt = build_turn_prompt(
@@ -150,6 +167,8 @@ async def run_conversation(
             history=state.history(),
             seed=seed + turn,
         )
+        if on_turn_start is not None:
+            on_turn_start(turn)
         record, state, blocked = await _execute_turn(
             runtime,
             case,
@@ -168,16 +187,20 @@ async def run_conversation(
             )
         total_latency += record.latency_ms
         consecutive_blocks = consecutive_blocks + 1 if blocked else 0
+        # Termination is decided before the checkpoint, so a resumed run never
+        # extends a conversation that already ended.
         if record.judge_complied:
-            state = state.complete("complied")
+            state = checkpoint(state.complete("complied"))
             break
         if state.status != "running":
+            checkpoint(state)
             return _finalize(
                 state, escalation, timestamp, model_metadata, total_latency
             )
         if consecutive_blocks >= CONSECUTIVE_BLOCK_GIVEUP:
-            state = state.complete("blocked_convergence")
+            state = checkpoint(state.complete("blocked_convergence"))
             break
+        checkpoint(state)
     if state.status == "running":
         state = state.complete("max_turns")
     outcome = _conversation_judge(
@@ -337,6 +360,35 @@ def _finalize(
     )
 
 
+def _failed_scenario(
+    run_id: str,
+    case: EvaluationCase,
+    escalation: str,
+    timestamp: str,
+    max_turns: int,
+    model_metadata: tuple[tuple[str, str], ...],
+    exc: Exception,
+) -> ScenarioOutcome:
+    return ScenarioOutcome(
+        run_id=run_id,
+        timestamp=timestamp,
+        conversation_id=f"{run_id}-{case.case_id}",
+        case_id=case.case_id,
+        attack_category=case.category,
+        objective=case.prompt,
+        escalation=escalation,
+        max_turns=max_turns,
+        turns=(),
+        status="failed",
+        termination_reason=f"campaign_error:{type(exc).__name__}",
+        conversation_verdict=ComplianceVerdict.UNSCORABLE.value,
+        conversation_reason="",
+        conversation_error=type(exc).__name__,
+        model_metadata=model_metadata,
+        total_latency_ms=0.0,
+    )
+
+
 async def run_conversation_campaign(
     runtime: _CampaignRuntime,
     cases: Sequence[EvaluationCase],
@@ -380,26 +432,18 @@ async def run_conversation_campaign(
             )
         except Exception as exc:
             records.append(
-                ScenarioOutcome(
-                    run_id=run_id,
-                    timestamp=timestamp,
-                    conversation_id=f"{run_id}-{case.case_id}",
-                    case_id=case.case_id,
-                    attack_category=case.category,
-                    objective=case.prompt,
-                    escalation=escalation,
-                    max_turns=max_turns,
-                    turns=(),
-                    status="failed",
-                    termination_reason=f"campaign_error:{type(exc).__name__}",
-                    conversation_verdict=ComplianceVerdict.UNSCORABLE.value,
-                    conversation_reason="",
-                    conversation_error=type(exc).__name__,
-                    model_metadata=model_metadata,
-                    total_latency_ms=0.0,
+                _failed_scenario(
+                    run_id, case, escalation, timestamp, max_turns, model_metadata, exc
                 )
             )
-    return tuple(records), aggregate_conversations(records, run_id=run_id)
+    summary = aggregate_conversations(records, run_id=run_id)
+    # Same accounting vocabulary as the single-turn summary (Task 13).
+    from .loop import _telemetry_completeness
+
+    consumer = getattr(runtime, "consumer", None)
+    if consumer is not None:
+        summary["telemetry"] = _telemetry_completeness(consumer)
+    return tuple(records), summary
 
 
 def write_conversations_jsonl(

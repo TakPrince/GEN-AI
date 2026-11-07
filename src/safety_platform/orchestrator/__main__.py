@@ -1,8 +1,12 @@
-"""CLI entrypoint: run the single-turn red-team campaign end to end.
+"""CLI entrypoint: durable single- and multi-turn red-team campaigns.
 
 Example:
-    python -m safety_platform.orchestrator --dataset \
-        evaluation/data/jbb-v2/cases.jsonl --attack-per-label 5
+    python -m safety_platform.orchestrator --dataset evaluation/data/jbb-v2/cases.jsonl
+    python -m safety_platform.orchestrator --campaign-status <run_id>
+    python -m safety_platform.orchestrator --resume <run_id>
+
+Exit codes: 0 completed; 1 incomplete (uncertain or pending work remains);
+2 usage error; 3 campaign lease held by another live process.
 """
 
 from __future__ import annotations
@@ -16,15 +20,26 @@ from pathlib import Path
 from ..app import _live_completion, _pipeline
 from ..evaluation.dataset import load_cases
 from ..evaluation.llm import ComplianceJudge, OllamaClient
+from .durable import (
+    CampaignError,
+    CampaignResult,
+    CampaignStore,
+    LeaseHeldError,
+    describe_campaign,
+    resume_campaign,
+    start_multi,
+    start_single,
+)
 from .loop import _run_id as _run_stamp
-from .loop import run_campaign, write_jsonl, write_summary
 from .mutators import STRATEGIES
+
+EXIT_COMPLETED, EXIT_INCOMPLETE, EXIT_USAGE, EXIT_LEASE_HELD = 0, 1, 2, 3
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="safety_platform.orchestrator",
-        description="Red-team orchestration harness (single- and multi-turn)",
+        description="Durable red-team orchestration (single- and multi-turn)",
     )
     parser.add_argument(
         "--dataset",
@@ -41,7 +56,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--out",
         default="evaluation/results",
-        help="output directory for JSONL + summary artifacts",
+        help="output directory for JSONL + summary artifacts and the campaign ledger",
     )
     parser.add_argument(
         "--judge-model",
@@ -51,7 +66,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--db",
         default=None,
-        help="telemetry sqlite path (defaults to a temp file outside the repo)",
+        help="campaign ledger + telemetry sqlite (default: <out>/orchestrator.sqlite3)",
     )
     parser.add_argument(
         "--mode",
@@ -70,126 +85,178 @@ def _parser() -> argparse.ArgumentParser:
         default=3,
         help="per-conversation turn cap (mode=multi)",
     )
+    parser.add_argument(
+        "--resume",
+        metavar="RUN_ID",
+        help="continue a campaign from its durable state (use the same --db/--out)",
+    )
+    parser.add_argument(
+        "--campaign-status",
+        metavar="RUN_ID",
+        help="print a campaign's durable progress and exit",
+    )
+    parser.add_argument(
+        "--takeover",
+        action="store_true",
+        help="with --resume: override a lease that may still be live "
+        "(only if that process is dead)",
+    )
     return parser
 
 
-async def _run_multi(args, cases) -> int:
-    from .escalation import ESCALATIONS
-    from .multi import (
-        _CampaignRuntime,  # noqa: F401  (runtime protocol)
-        run_conversation_campaign,
-        write_conversations_jsonl,
-    )
-
-    escalations = tuple(s.strip() for s in args.escalations.split(",") if s.strip())
-    for escalation in escalations:
-        if escalation not in ESCALATIONS:
-            _parser().error(f"unknown escalation {escalation!r}")
-    dataset_name = Path(args.dataset).parent.name
-    runtime = _pipeline(
-        str(Path(args.db or (f"{Path(tempfile_prefix())}-redteam.sqlite3")))
-    )
-    judge = ComplianceJudge(OllamaClient(args.judge_model))
-    records, summary = await run_conversation_campaign(
-        runtime,
-        cases,
-        judge,
-        _live_completion,
-        run_id=_run_stamp(),
-        per_label=args.attack_per_label,
-        max_turns=args.max_turns,
-        escalations=escalations,
-        seed=args.seed,
-        model_metadata=(
-            ("target", "qwen3:8b"),
-            ("judge", args.judge_model),
-            ("dataset", dataset_name),
-            ("mode", "multi"),
-        ),
-    )
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    jsonl_path = out_dir / f"redteam-multiturn-{summary['run_id']}.jsonl"
-    summary_path = out_dir / f"redteam-multiturn-{summary['run_id']}-summary.json"
-    write_conversations_jsonl(records, jsonl_path)
-    write_summary(summary, summary_path)
-    conversation_metrics = summary["conversation_metrics"]
-    totals = summary["totals"]
+def _report(result: CampaignResult) -> int:
+    campaign = result.summary["campaign"]
+    units = campaign["units"]
     print(
-        f"conversations {totals['conversations']}, scorable {totals['scorable']}: "
-        f"ASR {conversation_metrics['asr_pct']}% "
-        f"partial {conversation_metrics['partial_compliance_pct']}%, "
-        f"turn-ASR {summary['turn_metrics']['asr_pct']}%"
+        f"campaign {result.run_id}: {result.status}; units total={units['total']} "
+        f"completed={units['completed']} uncertain={units['uncertain']} "
+        f"pending={units['pending']}"
     )
-    print(f"records: {jsonl_path}")
-    print(f"summary: {summary_path}")
-    return 0
+    summary = result.summary
+    if campaign["kind"] == "single":
+        metrics, totals = summary["metrics"], summary["totals"]
+        asr = metrics["asr_pct"] if metrics["asr_pct"] is not None else "N/A"
+        print(
+            f"scorable {totals['scorable']}/{totals['attempted']}: ASR {asr}% "
+            f"(CI {metrics['asr_low_pct']}-{metrics['asr_high_pct']}%), "
+            f"block {metrics['block_rate_pct']}%, FPR {metrics['fpr_pct']}%, "
+            f"judge errors {totals['judge_errors']}"
+        )
+    else:
+        totals = summary["totals"]
+        conversation = summary["conversation_metrics"]
+        print(
+            f"conversations {totals['conversations']}, scorable {totals['scorable']}: "
+            f"ASR {conversation['asr_pct']}% "
+            f"partial {conversation['partial_compliance_pct']}%, "
+            f"turn-ASR {summary['turn_metrics']['asr_pct']}%"
+        )
+    print(f"records: {result.paths[0]}")
+    print(f"summary: {result.paths[1]}")
+    return EXIT_COMPLETED if result.status == "completed" else EXIT_INCOMPLETE
+
+
+def _status(db: str, run_id: str) -> int:
+    if not Path(db).exists():  # never create a ledger just to report on it
+        print(f"error: no campaign database at {db}", file=sys.stderr)
+        return EXIT_USAGE
+    store = CampaignStore(db)
+    try:
+        info = describe_campaign(store, run_id)
+    except CampaignError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    finally:
+        store.close()
+    units = info["units"]
+    print(f"campaign {run_id} ({info['kind']}): {info['label']}")
+    print(
+        f"units: total={units['total']} completed={units['completed']} "
+        f"uncertain={units['uncertain']} in_flight={units['in_flight']} "
+        f"pending={units['pending']}"
+    )
+    print(f"segments: {info['segments']}")
+    if info["label"] == "interrupted":
+        print(f"resume with: --resume {run_id} --db {db}")
+    return EXIT_COMPLETED
+
+
+async def _resume(db: str, run_id: str, *, takeover: bool) -> int:
+    if not Path(db).exists():
+        print(f"error: no campaign database at {db}", file=sys.stderr)
+        return EXIT_USAGE
+    store = CampaignStore(db)
+    try:
+        campaign = store.campaign(run_id)
+    except CampaignError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    finally:
+        store.close()
+    environ["SAFETY_UI_SPECULATIVE_ECHO"] = "0"
+    judge_model = dict(campaign["config"]["model_metadata"])["judge"]
+    print(f"resuming campaign {run_id} ({campaign['status']})", flush=True)
+    try:
+        result = await resume_campaign(
+            db,
+            _pipeline(db),
+            ComplianceJudge(OllamaClient(judge_model)),
+            _live_completion,
+            run_id=run_id,
+            takeover=takeover,
+        )
+    except LeaseHeldError as exc:
+        print(
+            f"error: {exc}. Wait for the lease to lapse; pass --takeover only if "
+            "that process is known to be dead.",
+            file=sys.stderr,
+        )
+        return EXIT_LEASE_HELD
+    return _report(result)
 
 
 async def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    db = args.db or str(Path(args.out) / "orchestrator.sqlite3")
+    if args.campaign_status:
+        return _status(db, args.campaign_status)
+    if args.resume:
+        return await _resume(db, args.resume, takeover=args.takeover)
+
     strategies = tuple(s.strip() for s in args.strategies.split(",") if s.strip())
     for strategy in strategies:
         if strategy not in STRATEGIES:
-            parser = _parser()
             parser.error(f"unknown strategy {strategy!r}")
+    escalations = tuple(s.strip() for s in args.escalations.split(",") if s.strip())
 
     cases = tuple(load_cases(Path(args.dataset)))
-    if args.mode == "multi":
-        return await _run_multi(args, cases)
-
     attacks = sum(1 for case in cases if case.label == "attack")
-    benign_cases = len(cases) - attacks
     print(
         f"loaded {len(cases)} cases from {args.dataset}: "
-        f"{attacks} attack, {benign_cases} benign"
+        f"{attacks} attack, {len(cases) - attacks} benign"
     )
     dataset_name = Path(args.dataset).parent.name
-
     environ["SAFETY_UI_SPECULATIVE_ECHO"] = "0"
-    db_path = Path(args.db or (f"{Path(tempfile_prefix())}-redteam.sqlite3"))
-    runtime = _pipeline(str(db_path))
     judge = ComplianceJudge(OllamaClient(args.judge_model))
-    records, summary = await run_campaign(
-        runtime,
-        cases,
-        judge,
-        _live_completion,
-        run_id=_run_stamp(),
-        per_label=args.attack_per_label,
-        strategies=strategies,
-        seed=args.seed,
-        model_metadata=(
-            ("target", "qwen3:8b"),
-            ("judge", args.judge_model),
-            ("dataset", dataset_name),
-        ),
+    run_id = _run_stamp()
+    # Announced before any external request so an interrupted run can be resumed.
+    print(f"campaign: {run_id}", flush=True)
+    base_metadata = (
+        ("target", "qwen3:8b"),
+        ("judge", args.judge_model),
+        ("dataset", dataset_name),
     )
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    jsonl_path = out_dir / f"redteam-singleturn-{summary['run_id']}.jsonl"
-    summary_path = out_dir / f"redteam-singleturn-{summary['run_id']}-summary.json"
-    write_jsonl(records, jsonl_path)
-    write_summary(summary, summary_path)
-    metrics = summary["metrics"]
-    totals = summary["totals"]
-    print(
-        f"scorable {totals['scorable']}/{totals['attempted']}: "
-        f"ASR {metrics['asr_pct'] if metrics['asr_pct'] is not None else 'N/A'}% "
-        f"(CI {metrics['asr_low_pct']}-{metrics['asr_high_pct']}%), "
-        f"block {metrics['block_rate_pct']}%, "
-        f"FPR {metrics['fpr_pct']}%, "
-        f"judge errors {totals['judge_errors']}"
-    )
-    print(f"records: {jsonl_path}")
-    print(f"summary: {summary_path}")
-    return 0
-
-
-def tempfile_prefix() -> str:
-    import tempfile
-
-    return tempfile.mkdtemp(prefix="safety-platform-")
+    if args.mode == "multi":
+        result = await start_multi(
+            db,
+            _pipeline(db),
+            cases,
+            judge,
+            _live_completion,
+            run_id=run_id,
+            artifact_dir=args.out,
+            per_label=args.attack_per_label,
+            max_turns=args.max_turns,
+            escalations=escalations,
+            seed=args.seed,
+            model_metadata=(*base_metadata, ("mode", "multi")),
+        )
+    else:
+        result = await start_single(
+            db,
+            _pipeline(db),
+            cases,
+            judge,
+            _live_completion,
+            run_id=run_id,
+            artifact_dir=args.out,
+            per_label=args.attack_per_label,
+            strategies=strategies,
+            seed=args.seed,
+            model_metadata=base_metadata,
+        )
+    return _report(result)
 
 
 def _cli() -> None:
@@ -199,5 +266,5 @@ def _cli() -> None:
         sys.exit(130)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     _cli()

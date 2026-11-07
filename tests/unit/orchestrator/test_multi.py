@@ -320,6 +320,21 @@ async def test_campaign_runs_per_label_and_aggregates(runtime) -> None:
     totals = summary["totals"]
     assert totals["conversations"] == 2
     assert totals["scorable"] == 2
+    # Task 13: actual run-level telemetry accounting, same vocabulary as
+    # single-turn summaries; historical keys are untouched.
+    block = summary["telemetry"]
+    assert block["status"] in ("complete", "no_events")
+    assert set(block) >= {
+        "status",
+        "events_received",
+        "events_written",
+        "events_duplicated",
+        "events_dropped",
+        "batches_retried",
+        "events_dead_lettered",
+        "events_lost",
+        "unaccounted_events",
+    }
 
 
 @pytest.mark.asyncio

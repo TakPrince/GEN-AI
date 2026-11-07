@@ -101,6 +101,9 @@ class DefenseResult:
     speculative_echo_status: str
     routing_drift_score: float
     token_anomaly_score: float
+    # Additive: persistence latency measured separately, not part of decision
+    # path; `latency_ms` keeps its end-to-end benchmark semantics.
+    telemetry_latency_ms: float = 0.0
 
 
 class _DefenseRuntime(Protocol):
@@ -226,7 +229,13 @@ async def execute_defense(
     outcome = "error"
 
     async def _finalize() -> DefenseResult:
+        finalized_ns = time.perf_counter_ns()
         persisted, db_error = await persist_telemetry(runtime, collector.events)
+        # Persistence latency is additive, not part of the defense decision
+        # path: `latency_ms` keeps its end-to-end benchmark semantics.
+        telemetry_latency_ms = max(
+            0.0, (time.perf_counter_ns() - finalized_ns) / 1_000_000
+        )
         return DefenseResult(
             request_id=request.request_id or uuid.uuid4().hex,
             trace_id=context.trace_id,
@@ -250,6 +259,7 @@ async def execute_defense(
             attack_id=request.attack_id,
             attack_category=request.attack_category,
             latency_ms=max(0.0, (time.perf_counter_ns() - started) / 1_000_000),
+            telemetry_latency_ms=telemetry_latency_ms,
             stage_observations=tuple(observations),
             error=error,
             failure_stage=failure_stage,

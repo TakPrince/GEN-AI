@@ -235,7 +235,13 @@ def _pipeline(database: str) -> _Pipeline:
     # Per-turn drain (max_batch_wait_ms=0): Streamlit asyncio.run()s each turn on a
     # fresh loop, so a long-lived consumer task cannot survive between reruns.
     bus = AsyncTelemetryBus()
-    consumer = TelemetryConsumer(bus, sink, max_batch_wait_ms=0)
+    consumer = TelemetryConsumer(
+        bus,
+        sink,
+        max_batch_wait_ms=0,
+        # Retry once, then append failed rows to a recoverable dead-letter file.
+        dead_letter_path=f"{database}.dead-letter.jsonl",
+    )
     return _Pipeline(
         regex=regex,
         vector=vector,
@@ -317,22 +323,20 @@ async def _evaluate(
     )
 
 
-def _raw_completion(prompt: str) -> str:
-    return prompt
-
-
 _COMPLETION_MODEL = "qwen3:8b"
 
 
 @lru_cache(maxsize=64)
 def _live_completion(prompt: str) -> str:
-    try:
-        completion = OllamaClient(_COMPLETION_MODEL).generate(
-            prompt, think=False, num_predict=16
-        )
-        return completion.strip() or _raw_completion(prompt)
-    except (OllamaError, KeyError, TypeError, ValueError):
-        return _raw_completion(prompt)
+    # A failed or empty model call must never be masked by an echo of the
+    # prompt: let the exception propagate so execute_defense records a real
+    # target failure (outcome=error, failure_stage=target).
+    completion = OllamaClient(_COMPLETION_MODEL).generate(
+        prompt, think=False, num_predict=16
+    )
+    if not completion.strip():
+        raise OllamaError("empty_target_completion")
+    return completion.strip()
 
 
 def _turns() -> list[_Turn]:

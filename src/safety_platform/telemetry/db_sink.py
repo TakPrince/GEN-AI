@@ -34,9 +34,8 @@ CREATE TABLE IF NOT EXISTS stage_event (
 """
 
 _INDEXES = (
-    "CREATE INDEX IF NOT EXISTS idx_stage_event_timestamp "
-    "ON stage_event(timestamp_ns)",
-    "CREATE INDEX IF NOT EXISTS idx_stage_event_trace " "ON stage_event(trace_id)",
+    "CREATE INDEX IF NOT EXISTS idx_stage_event_timestamp ON stage_event(timestamp_ns)",
+    "CREATE INDEX IF NOT EXISTS idx_stage_event_trace ON stage_event(trace_id)",
     "CREATE INDEX IF NOT EXISTS idx_stage_event_conversation "
     "ON stage_event(conversation_id)",
 )

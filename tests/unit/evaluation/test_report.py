@@ -140,7 +140,7 @@ def test_load_report_rejects_unknown_run(tmp_path: Path) -> None:
     connection = sqlite3.connect(empty)
     connection.executescript(SCHEMA)
     connection.close()
-    with pytest.raises(ValueError, match="contains no completed runs"):
+    with pytest.raises(ValueError, match="contains no runs"):
         load_report(str(empty))
 
 
@@ -164,9 +164,10 @@ def test_load_report_prefers_completed_run_over_aborted(tmp_path: Path) -> None:
     assert report.run_id == "run-1"
 
 
-def test_load_report_rejects_database_without_completed_runs(
+def test_load_report_resolves_interrupted_run_and_discloses_it(
     tmp_path: Path,
 ) -> None:
+    """Task 14: the latest run is durable even when never completed."""
     path = database(tmp_path)
     connection = sqlite3.connect(path)
     try:
@@ -175,8 +176,8 @@ def test_load_report_rejects_database_without_completed_runs(
     finally:
         connection.close()
 
-    with pytest.raises(ValueError, match="contains no completed runs"):
-        load_report(str(path))
+    report = load_report(str(path))
+    assert report.completed is False
 
 
 def test_statistics_handle_empty_inputs() -> None:

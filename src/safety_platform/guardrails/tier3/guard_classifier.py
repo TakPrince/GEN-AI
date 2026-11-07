@@ -21,8 +21,7 @@ from ...evaluation.llm import _json_object
 from .classifier import ClassifierClient, Tier3Classifier, Tier3Result
 
 _INSTRUCTION = (
-    "Classify the user message as safe or unsafe. "
-    "Return only one word: safe or unsafe."
+    "Classify the user message as safe or unsafe. Return only one word: safe or unsafe."
 )
 
 _ARBITRATION_SYSTEM = (

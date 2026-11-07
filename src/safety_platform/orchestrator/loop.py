@@ -145,14 +145,19 @@ async def run_campaign(
                 model_metadata=model_metadata,
             )
         )
-    return tuple(records), aggregate(records, run_id=run_id)
+    summary = aggregate(records, run_id=run_id)
+    # Actual run-level stats from the live consumer; absent if the runtime
+    # does not carry telemetry (historical summaries stay untouched).
+    consumer = getattr(runtime, "consumer", None)
+    if consumer is not None:
+        summary["telemetry"] = _telemetry_completeness(consumer)
+    return tuple(records), summary
 
 
-async def _execute_single(
+async def _defend_single(
     runtime: _CampaignRuntime,
     case: EvaluationCase,
     mutation: Mutation,
-    judge: _Judger,
     completion: Callable[[str], str],
     *,
     run_id: str,
@@ -160,6 +165,7 @@ async def _execute_single(
     seed: int,
     model_metadata: tuple[tuple[str, str], ...],
 ) -> AttemptOutcome:
+    """Target stage only: the defended request/response, before any judging."""
     is_attack = case.label == "attack"
     request = DefenseRequest(
         prompt=mutation.executed_prompt,
@@ -228,11 +234,47 @@ async def _execute_single(
         failure_stage=result.failure_stage,
         execution_error=result.error,
     )
-    if record.execution_error is None and record.outcome != "error":
+    return record
+
+
+def _needs_judging(record: AttemptOutcome) -> bool:
+    return record.execution_error is None and record.outcome != "error"
+
+
+def _judge_single(
+    record: AttemptOutcome, mutation: Mutation, judge: _Judger
+) -> AttemptOutcome:
+    """Judging stage: a pure function of the received record, so it can resume."""
+    if _needs_judging(record):
         record = _judge_record(record, mutation, judge)
     if record.blocked and record.raw_response is not None:
         return _raw_judge_record(record, mutation, judge)
     return record
+
+
+async def _execute_single(
+    runtime: _CampaignRuntime,
+    case: EvaluationCase,
+    mutation: Mutation,
+    judge: _Judger,
+    completion: Callable[[str], str],
+    *,
+    run_id: str,
+    timestamp: str,
+    seed: int,
+    model_metadata: tuple[tuple[str, str], ...],
+) -> AttemptOutcome:
+    record = await _defend_single(
+        runtime,
+        case,
+        mutation,
+        completion,
+        run_id=run_id,
+        timestamp=timestamp,
+        seed=seed,
+        model_metadata=model_metadata,
+    )
+    return _judge_single(record, mutation, judge)
 
 
 def _judge_record(
@@ -287,12 +329,49 @@ def write_summary(summary: dict[str, Any], destination: Path) -> None:
     destination.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
 
+def _telemetry_completeness(consumer: object) -> dict[str, Any]:
+    """Run-level accounting from the actual ConsumerStats (Task 13).
+
+    Never estimates from SQLite row counts and never reports `complete`
+    while events are unaccounted, lost, dropped or only dead-lettered.
+    """
+    stats = getattr(getattr(consumer, "stats", None), "events_received", None)
+    if stats is None or not hasattr(consumer, "dropped_events"):
+        return {"status": "unavailable"}
+    s = consumer.stats  # type: ignore[attr-defined]
+    received = s.events_received
+    if received == 0 and consumer.dropped_events == 0:  # type: ignore[attr-defined]
+        return {"status": "no_events"}
+    unaccounted = received - (
+        s.events_written + s.events_duplicated + s.events_dead_lettered + s.events_lost
+    )
+    losses = s.events_lost + consumer.dropped_events + unaccounted  # type: ignore[attr-defined]
+    if losses > 0:
+        status = "incomplete"
+    elif s.events_dead_lettered > 0:
+        status = "recoverable"
+    else:
+        status = "complete"
+    return {
+        "status": status,
+        "events_received": received,
+        "events_written": s.events_written,
+        "events_duplicated": s.events_duplicated,
+        "events_dropped": consumer.dropped_events,  # type: ignore[attr-defined]
+        "batches_retried": s.batches_retried,
+        "events_dead_lettered": s.events_dead_lettered,
+        "events_lost": s.events_lost,
+        "unaccounted_events": unaccounted,
+    }
+
+
 def attempt_fields() -> tuple[str, ...]:
     return tuple(field.name for field in fields(AttemptOutcome))
 
 
 __all__ = [
     "AttemptOutcome",
+    "_telemetry_completeness",
     "run_campaign",
     "write_jsonl",
     "write_summary",

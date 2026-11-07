@@ -26,4 +26,6 @@ metrics/telemetry.sqlite3*
 # Local databases (untracked in beafc41; keep off the work tree)
 metrics/*.sqlite3
 evaluation/results/*.sqlite3
+metrics/*.dead-letter.jsonl
+evaluation/results/*.dead-letter.jsonl
 
