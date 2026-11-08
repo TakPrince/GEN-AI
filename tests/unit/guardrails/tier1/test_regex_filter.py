@@ -156,3 +156,22 @@ def test_zero_width_block_is_ignored() -> None:
     detector = RegexFilter([RegexRule("look", r"(?=secret)", RegexAction.BLOCK)])
 
     assert detector.evaluate("secret").verdict is RegexVerdict.PASS
+
+
+def test_redacted_text_is_never_empty_for_redact_verdict() -> None:
+    # Task 21 fallback contract: `first.redacted_text or prompt` falls back to
+    # the screened-original when redaction made no change. That fallback is only
+    # safe if a REDACT verdict can never carry an empty redacted_text (otherwise
+    # the raw unscreened prompt would reach the target).
+    detector = RegexFilter(
+        [
+            RegexRule("redact.secret", r"secret=\w+", RegexAction.REDACT),
+            RegexRule("redact.email", r"[a-z]+@[a-z]+\.[a-z]+", RegexAction.REDACT),
+        ]
+    )
+
+    for text in ("secret=abc", "send to a.b@c.de", "secret=abc or a.b@c.de"):
+        result = detector.evaluate(text)
+        assert result.verdict is RegexVerdict.REDACT
+        assert result.redacted_text
+        assert "[REDACTED]" in result.redacted_text

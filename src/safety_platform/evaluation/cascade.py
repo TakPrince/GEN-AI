@@ -63,22 +63,6 @@ class CascadeRuntime:
         started = time.perf_counter_ns()
         tier3_invoked = False
         echo_status: str | None = None
-        if probe is not None:
-            echo = await probe.probe(text)
-            echo_status = echo.status
-            if echo.status == SPECULATIVE_VIOLATING:
-                route = self.router.route(
-                    context,
-                    (
-                        StageDecision(
-                            stage=Stage.ROUTER,
-                            verdict=SafetyVerdict.BLOCK,
-                            reason_codes=("speculative_echo:violating",),
-                        ),
-                    ),
-                )
-                return _outcome(route, started, False, 0.0, echo_status)
-
         first = self.regex.evaluate(text)
         decisions = [
             StageDecision(
@@ -92,6 +76,23 @@ class CascadeRuntime:
         if first.verdict in (SafetyVerdict.BLOCK, SafetyVerdict.ERROR):
             route = self.router.route(context, decisions)
             return _outcome(route, started, False, 0.0)
+
+        # Opt-in echo probe: never before input screening, never unscreened.
+        if probe is not None:
+            echo = await probe.probe(first.redacted_text or text)
+            echo_status = echo.status
+            if echo.status == SPECULATIVE_VIOLATING:
+                route = self.router.route(
+                    context,
+                    (
+                        StageDecision(
+                            stage=Stage.ROUTER,
+                            verdict=SafetyVerdict.BLOCK,
+                            reason_codes=("speculative_echo:violating",),
+                        ),
+                    ),
+                )
+                return _outcome(route, started, False, 0.0, echo_status)
 
         second = self.vector.evaluate(text)
         decisions.append(

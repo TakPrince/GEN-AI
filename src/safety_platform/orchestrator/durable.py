@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from ..evaluation.dataset import EvaluationCase
-from ..evaluation.llm import ComplianceVerdict
+from ..evaluation.llm import ComplianceVerdict, ConversationVerdict, JudgeResult
 from .attack_state import AttackState, TurnRecord
 from .escalation import ESCALATIONS
 from .loop import (
@@ -84,6 +84,22 @@ CREATE TABLE IF NOT EXISTS campaign_unit (
     PRIMARY KEY (run_id, unit_id),
     UNIQUE (run_id, ordinal)
 );
+CREATE TABLE IF NOT EXISTS judge_attempt (
+    attempt_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES campaign(run_id),
+    unit_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    judge_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (
+        status IN ('running', 'completed', 'failed', 'interrupted')
+    ),
+    result_json TEXT,
+    error TEXT,
+    started_ns INTEGER NOT NULL,
+    finished_ns INTEGER,
+    UNIQUE (run_id, unit_id, stage, attempt)
+);
 """
 
 _LEASE_S = 900.0
@@ -115,12 +131,20 @@ class _Heartbeat:
     """Renews the lease from its own thread and connection (SQLite handles are
     thread-bound). Renewal stops when ownership is gone or the thread is stopped."""
 
-    def __init__(self, path: str, run_id: str, owner: str, lease_ns: int) -> None:
+    def __init__(
+        self,
+        path: str,
+        run_id: str,
+        owner: str,
+        lease_ns: int,
+        lost: threading.Event,
+    ) -> None:
         self._path = path
         self._run_id = run_id
         self._owner = owner
         self._lease_ns = lease_ns
         self._interval = lease_ns / 3 / 1_000_000_000  # renew well inside the TTL
+        self._lost = lost  # set when the execution loop must stop
         self._stop = threading.Event()
         self.thread = threading.Thread(
             target=self._run, name=f"safety-lease-{run_id}", daemon=True
@@ -136,21 +160,29 @@ class _Heartbeat:
 
     def _run(self) -> None:
         con = sqlite3.connect(self._path, timeout=self._interval, isolation_level=None)
+        deadline = time.time_ns() + self._lease_ns  # acquire() just set the lease
         try:
             while not self._stop.wait(self._interval):
+                started = time.time_ns()
                 try:
                     if not self._renew(con):
                         _LOG.error("lease for %s lost; renewal stopped", self._run_id)
+                        self._lost.set()
                         return
+                    deadline = started + self._lease_ns
                 except sqlite3.Error as exc:
-                    # Transient contention: retry next tick. If renewal keeps
-                    # failing, the lease lapses and the fenced writes refuse to commit.
+                    # Transient contention: retry next tick. Once the lease must
+                    # have lapsed unrenewed, stop the loop as well.
                     _LOG.warning(
                         "lease renewal for %s failed (%s); will retry",
                         self._run_id,
                         type(exc).__name__,
                     )
                     _rollback_quietly(con)
+                    if time.time_ns() >= deadline:
+                        _LOG.error("lease for %s expired unrenewed", self._run_id)
+                        self._lost.set()
+                        return
         finally:
             con.close()
 
@@ -176,9 +208,15 @@ class CampaignStore:
         self._con = sqlite3.connect(path, timeout=30.0, isolation_level=None)
         self._con.executescript(_SCHEMA)
         self._lease_ns = int(lease_s * 1_000_000_000)
+        self.lost = threading.Event()  # set by the heartbeat on lease loss
 
     def heartbeat(self, run_id: str, *, owner: str) -> _Heartbeat:
-        return _Heartbeat(self._path, run_id, owner, self._lease_ns)
+        return _Heartbeat(self._path, run_id, owner, self._lease_ns, self.lost)
+
+    def raise_if_lost(self, run_id: str) -> None:
+        """Once the heartbeat signals loss, no write from this worker may proceed."""
+        if self.lost.is_set():
+            raise CampaignError(f"lost lease on campaign {run_id}")
 
     def close(self) -> None:
         self._con.close()
@@ -259,6 +297,7 @@ class CampaignStore:
         status: str,
         telemetry: dict[str, Any] | None,
     ) -> None:
+        self.raise_if_lost(run_id)  # a stale worker must never mark completion
         now = time.time_ns()
         with self._tx() as con:
             cursor = con.execute(
@@ -281,6 +320,7 @@ class CampaignStore:
         progress: Any = None,
         result: Any = None,
     ) -> None:
+        self.raise_if_lost(run_id)
         now = time.time_ns()
         marks = ",".join("?" * len(allowed_from))
         with self._tx() as con:
@@ -321,11 +361,12 @@ class CampaignStore:
     def save_progress(
         self, run_id: str, unit_id: str, progress: Any, *, owner: str
     ) -> None:
+        # pending: a response was persisted before judging (Task 17 checkpoint).
         self._move(
             run_id,
             unit_id,
             owner=owner,
-            allowed_from=("in_flight",),
+            allowed_from=("in_flight", "pending"),
             to="pending",
             progress=progress,
         )
@@ -353,6 +394,149 @@ class CampaignStore:
             to="uncertain",
             result=result,
         )
+
+    def _fence(
+        self, con: sqlite3.Connection, run_id: str, owner: str, now: int
+    ) -> None:
+        self.raise_if_lost(run_id)
+        beat = con.execute(
+            "UPDATE campaign SET lease_until_ns = ?, updated_ns = ?"
+            " WHERE run_id = ? AND owner = ? AND lease_until_ns >= ?",
+            (now + self._lease_ns, now, run_id, owner, now),
+        )
+        if beat.rowcount != 1:
+            raise CampaignError(f"lost lease on campaign {run_id}")
+
+    def judge_begin(
+        self, run_id: str, unit_id: str, stage: str, *, owner: str, judge_id: str
+    ) -> str:
+        now = time.time_ns()
+        with self._tx() as con:
+            (attempt,) = con.execute(
+                "SELECT COUNT(*) + 1 FROM judge_attempt"
+                " WHERE run_id = ? AND unit_id = ? AND stage = ?",
+                (run_id, unit_id, stage),
+            ).fetchone()
+            attempt_id = f"{run_id}:{unit_id}:{stage}:{attempt}"
+            con.execute(
+                "INSERT INTO judge_attempt (attempt_id, run_id, unit_id, stage,"
+                " attempt, judge_id, status, started_ns)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'running', ?)",
+                (attempt_id, run_id, unit_id, stage, attempt, judge_id, now),
+            )
+            self._fence(con, run_id, owner, now)
+        return attempt_id
+
+    def judge_end(
+        self,
+        run_id: str,
+        attempt_id: str,
+        *,
+        owner: str,
+        status: str,
+        result: Any = None,
+        error: str | None = None,
+    ) -> None:
+        now = time.time_ns()
+        with self._tx() as con:
+            cursor = con.execute(
+                "UPDATE judge_attempt SET status = ?, result_json = ?, error = ?,"
+                " finished_ns = ? WHERE attempt_id = ? AND status = 'running'",
+                (
+                    status,
+                    None if result is None else _dump(result),
+                    error,
+                    now,
+                    attempt_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise CampaignError(f"judge attempt {attempt_id} is not running")
+            self._fence(con, run_id, owner, now)
+
+    def interrupt_judges(self, run_id: str, *, owner: str) -> None:
+        """Attempts still running belong to a dead process: keep them, mark them."""
+        now = time.time_ns()
+        with self._tx() as con:
+            con.execute(
+                "UPDATE judge_attempt SET status = 'interrupted', finished_ns = ?"
+                " WHERE run_id = ? AND status = 'running'",
+                (now, run_id),
+            )
+            self._fence(con, run_id, owner, now)
+
+    def completed_judge(
+        self, run_id: str, unit_id: str, stage: str, judge_id: str
+    ) -> dict[str, Any] | None:
+        """Latest completed verdict of this exact judge identity, if any."""
+        row = self._con.execute(
+            "SELECT attempt_id, result_json FROM judge_attempt WHERE run_id = ?"
+            " AND unit_id = ? AND stage = ? AND judge_id = ? AND status = 'completed'"
+            " ORDER BY attempt DESC LIMIT 1",
+            (run_id, unit_id, stage, judge_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return {"attempt_id": row[0], "result": _load(row[1])}
+
+    def judge_attempts(self, run_id: str) -> list[dict[str, Any]]:
+        rows = self._con.execute(
+            "SELECT attempt_id, unit_id, stage, attempt, judge_id, status,"
+            " result_json, error FROM judge_attempt WHERE run_id = ? ORDER BY rowid",
+            (run_id,),
+        ).fetchall()
+        attempts = []
+        for (
+            attempt_id,
+            unit_id,
+            stage,
+            attempt,
+            judge_id,
+            status,
+            result,
+            error,
+        ) in rows:
+            attempts.append(
+                {
+                    "attempt_id": attempt_id,
+                    "unit_id": unit_id,
+                    "stage": stage,
+                    "attempt": attempt,
+                    "judge_id": judge_id,
+                    "status": status,
+                    "result": _load(result),
+                    "error": error,
+                }
+            )
+        return attempts
+
+    def judge_summary(self, run_id: str, selected: list[str]) -> dict[str, Any]:
+        """Status counts, plus the attempts that unit results reference."""
+        attempts = self.judge_attempts(run_id)
+        counts = {
+            name: sum(1 for a in attempts if a["status"] == name)
+            for name in ("running", "completed", "failed", "interrupted")
+        }
+        return {"counts": counts, "selected": sorted(selected)}
+
+    def list_runs(self) -> list[dict[str, Any]]:
+        """Read-only campaign listing for dashboards; nothing else reads this."""
+        rows = self._con.execute(
+            "SELECT run_id, kind, status, config_json, artifact_dir, created_ns,"
+            " updated_ns FROM campaign ORDER BY created_ns"
+        ).fetchall()
+        return [
+            {
+                "run_id": row[0],
+                "kind": row[1],
+                "status": row[2],
+                "config": _load(row[3]),
+                "artifact_dir": row[4],
+                "created_ns": row[5],
+                "updated_ns": row[6],
+            }
+            for row in rows
+        ]
 
     def campaign(self, run_id: str) -> dict[str, Any]:
         row = self._con.execute(
@@ -501,9 +685,134 @@ def _uncertain_attempt(
 
 
 def _decode_attempt(data: dict[str, Any]) -> AttemptOutcome:
+    fields = {k: v for k, v in data.items() if k != "judge_refs"}
     return AttemptOutcome(
-        **{**data, "model_metadata": tuple(tuple(p) for p in data["model_metadata"])}
+        **{
+            **fields,
+            "model_metadata": tuple(tuple(p) for p in fields["model_metadata"]),
+        }
     )
+
+
+def _judge_id(config: dict[str, Any]) -> str:
+    return dict(_model_metadata(config)).get("judge", "unknown")
+
+
+def _judge_identity(judge: Any, config: dict[str, Any]) -> str:
+    """The injected judge's own identity; the configured name only as a fallback."""
+    identity = getattr(judge, "identity", None)
+    return identity if identity else _judge_id(config)
+
+
+def _judge_refs(result: dict[str, Any] | None) -> list[str]:
+    if not result:
+        return []
+    return [ref for ref in result.get("judge_refs", {}).values() if ref]
+
+
+class _JudgeRecorder:
+    """Judge proxy: every real invocation gets its own recorded attempt. A stage that
+    already has a completed attempt reuses it, so a retry never replaces a verdict."""
+
+    def __init__(
+        self,
+        store: CampaignStore,
+        run_id: str,
+        unit_id: str,
+        owner: str,
+        judge: Any,
+        judge_id: str,
+        *,
+        stage: str,
+        next_stage: str | None = None,
+    ) -> None:
+        self._store = store
+        self._run_id = run_id
+        self._unit_id = unit_id
+        self._owner = owner
+        self._judge = judge
+        self._judge_id = judge_id
+        self.stage = stage
+        self._next_stage = next_stage
+        self.selected: dict[str, str | None] = {}  # stage -> attempt used, or None
+
+    def judge(self, prompt: str, response: str) -> JudgeResult:
+        stage = self._take_stage()
+        done = self._reusable(stage)
+        if done is not None:
+            return JudgeResult(**done["result"])
+        attempt_id = self._begin(stage)
+        try:
+            verdict = self._judge.judge(prompt, response)
+        except Exception as exc:
+            self._end(attempt_id, stage, "failed", error=type(exc).__name__)
+            raise
+        self._end(
+            attempt_id,
+            stage,
+            "failed" if verdict.error else "completed",
+            result=asdict(verdict),
+            error=verdict.error,
+        )
+        return verdict
+
+    def judge_conversation(
+        self, objective: str, transcript: str
+    ) -> ConversationVerdict:
+        done = self._reusable("conversation")
+        if done is not None:
+            found = done["result"]
+            return ConversationVerdict(
+                ComplianceVerdict(found["verdict"]), found["reason"], found["error"]
+            )
+        attempt_id = self._begin("conversation")
+        try:
+            verdict = self._judge.judge_conversation(objective, transcript)
+        except Exception as exc:
+            self._end(attempt_id, "conversation", "failed", error=type(exc).__name__)
+            raise
+        result = {
+            "verdict": verdict.verdict.value,
+            "reason": verdict.reason,
+            "error": verdict.error,
+        }
+        self._end(
+            attempt_id,
+            "conversation",
+            "failed" if verdict.error else "completed",
+            result=result,
+            error=verdict.error,
+        )
+        return verdict
+
+    def _reusable(self, stage: str) -> dict[str, Any] | None:
+        done = self._store.completed_judge(
+            self._run_id, self._unit_id, stage, self._judge_id
+        )
+        if done is not None:
+            self.selected[stage] = done["attempt_id"]
+        return done
+
+    def _take_stage(self) -> str:
+        stage = self.stage
+        if self._next_stage is not None:
+            self.stage, self._next_stage = self._next_stage, None
+        return stage
+
+    def _begin(self, stage: str) -> str:
+        return self._store.judge_begin(
+            self._run_id,
+            self._unit_id,
+            stage,
+            owner=self._owner,
+            judge_id=self._judge_id,
+        )
+
+    def _end(self, attempt_id: str, stage: str, status: str, **fields: Any) -> None:
+        self._store.judge_end(
+            self._run_id, attempt_id, owner=self._owner, status=status, **fields
+        )
+        self.selected[stage] = attempt_id if status == "completed" else None
 
 
 async def _execute_single_units(
@@ -516,6 +825,7 @@ async def _execute_single_units(
     owner: str,
 ) -> None:
     for unit in store.units(run_id):
+        store.raise_if_lost(run_id)  # no new unit once ownership is gone
         if unit["status"] != "pending":
             continue  # confirmed or uncertain work is never executed again
         plan = unit["plan"]
@@ -547,8 +857,23 @@ async def _execute_single_units(
                 )
         else:  # a response survived an earlier crash: judge it, never resend
             record = _decode_attempt(unit["progress"]["record"])
-        record = _judge_single(record, mutation, judge)
-        store.complete_unit(run_id, unit["unit_id"], asdict(record), owner=owner)
+        recorder = _JudgeRecorder(
+            store,
+            run_id,
+            unit["unit_id"],
+            owner,
+            judge,
+            _judge_identity(judge, config),
+            stage="final",
+            next_stage="raw",  # _judge_single judges the final, then the raw response
+        )
+        record = _judge_single(record, mutation, recorder)
+        store.complete_unit(
+            run_id,
+            unit["unit_id"],
+            {**asdict(record), "judge_refs": recorder.selected},
+            owner=owner,
+        )
 
 
 def _multi_config(
@@ -624,11 +949,12 @@ def _state_from_progress(
 
 
 def _decode_scenario(data: dict[str, Any]) -> ScenarioOutcome:
+    fields = {k: v for k, v in data.items() if k != "judge_refs"}
     return ScenarioOutcome(
         **{
-            **data,
-            "turns": tuple(TurnRecord(**turn) for turn in data["turns"]),
-            "model_metadata": tuple(tuple(p) for p in data["model_metadata"]),
+            **fields,
+            "turns": tuple(TurnRecord(**turn) for turn in fields["turns"]),
+            "model_metadata": tuple(tuple(p) for p in fields["model_metadata"]),
         }
     )
 
@@ -661,14 +987,26 @@ def _uncertain_scenario(
     )
 
 
-def _checkpoint_hooks(store: CampaignStore, run_id: str, unit_id: str, owner: str):
+def _checkpoint_hooks(
+    store: CampaignStore,
+    run_id: str,
+    unit_id: str,
+    owner: str,
+    recorder: _JudgeRecorder,
+):
     def on_turn_start(turn: int) -> None:
+        recorder.stage = f"turn:{turn}"
         store.mark_in_flight(run_id, unit_id, owner=owner)
+
+    def on_response(state: AttackState, record: TurnRecord) -> None:
+        # Response persisted before judging; the unit stays pending and resumable.
+        progress = {**_progress_of(state), "pending": asdict(record)}
+        store.save_progress(run_id, unit_id, progress, owner=owner)
 
     def on_turn_done(state: AttackState) -> None:
         store.save_progress(run_id, unit_id, _progress_of(state), owner=owner)
 
-    return on_turn_start, on_turn_done
+    return on_turn_start, on_response, on_turn_done
 
 
 async def _execute_multi_units(
@@ -681,16 +1019,29 @@ async def _execute_multi_units(
     owner: str,
 ) -> None:
     for unit in store.units(run_id):
+        store.raise_if_lost(run_id)  # no new unit once ownership is gone
         if unit["status"] != "pending":
             continue  # finished or uncertain conversations are never resumed
         unit_id, plan = unit["unit_id"], unit["plan"]
         case = EvaluationCase(**plan["case"])
-        on_start, on_done = _checkpoint_hooks(store, run_id, unit_id, owner)
+        pending = (unit["progress"] or {}).get("pending")
+        recorder = _JudgeRecorder(
+            store,
+            run_id,
+            unit_id,
+            owner,
+            judge,
+            _judge_identity(judge, config),
+            stage=f"turn:{pending['turn_number']}" if pending else "",
+        )
+        on_start, on_response, on_done = _checkpoint_hooks(
+            store, run_id, unit_id, owner, recorder
+        )
         try:
             outcome = await run_conversation(
                 runtime,
                 case,
-                judge,
+                recorder,
                 completion,
                 run_id=run_id,
                 escalation=plan["escalation"],
@@ -701,7 +1052,9 @@ async def _execute_multi_units(
                 resume_state=_state_from_progress(
                     run_id, plan, config, unit["progress"]
                 ),
+                resume_pending=None if pending is None else TurnRecord(**pending),
                 on_turn_start=on_start,
+                on_response=on_response,
                 on_turn_done=on_done,
             )
         except (
@@ -716,7 +1069,12 @@ async def _execute_multi_units(
                 _model_metadata(config),
                 exc,
             )
-        store.complete_unit(run_id, unit_id, asdict(outcome), owner=owner)
+        store.complete_unit(
+            run_id,
+            unit_id,
+            {**asdict(outcome), "judge_refs": recorder.selected},
+            owner=owner,
+        )
 
 
 class _Kind:
@@ -777,6 +1135,7 @@ async def _drive(
                     asdict(kind.uncertain(run_id, config, unit)),
                     owner=owner,
                 )
+        store.interrupt_judges(run_id, owner=owner)  # attempts a dead process began
         await kind.execute(store, run_id, config, runtime, judge, completion, owner)
         units = store.units(run_id)
         status = (
@@ -817,6 +1176,9 @@ def _export(store: CampaignStore, run_id: str, artifact_dir: str) -> CampaignRes
         "status": campaign["status"],
         "segments": campaign["segments"],
         "units": counts,
+        "judge_attempts": store.judge_summary(
+            run_id, [ref for unit in units for ref in _judge_refs(unit["result"])]
+        ),
     }
     out = Path(artifact_dir)
     out.mkdir(parents=True, exist_ok=True)

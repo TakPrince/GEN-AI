@@ -179,3 +179,45 @@ No component requires a paid or closed-source API.
 | **Experiments still required** | Larger held-out reruns beyond the 60-case pilot; the Innovation 1 calibration A/B; the Innovation 2 routing A/B (a trained-routing artifact, not hardcoded weights); iterative calibration cycles.                                   |
 
 The implementation state in this section reflects the current repository: guardrail libraries, telemetry, dashboard demo, and the evaluation harness are built and quality-gated (pytest/coverage/black/ruff/mypy/pyright), and one committed pilot evaluation produced a negative finding recorded with its full configuration — the numbers above are reported honestly as a negative result, not evidence of success.
+
+
+---
+
+## 10. Running the System
+
+All commands were verified against the installed environment (Python 3.13, deps
+in `pyproject.toml`). No interactive setup script exists; commands run from the
+repository root.
+
+```bash
+make lint                # black --check, ruff, mypy (src + metrics + tests)
+make test                # full suite; live-Ollama test stays opt-in/skipped
+make ui                  # Streamlit dashboard at http://localhost:8501
+PYTHONPATH=src python -m pytest tests/unit -q --cov=safety_platform   # coverage
+```
+
+**Prerequisites:** Ollama running on `127.0.0.1:11434` with the models used by
+the configuration (`qwen3:8b` — target and evaluation Tier-3/judge,
+`llama3.2:latest` — evaluation target/embeddings, `llama3.1:8b` — dashboard
+judge). Nothing else is required; Ollama traffic uses stdlib `urllib`, not an SDK.
+
+Dashboard (`make ui`): four pages — Overview (real metrics, honest empty
+states), Live Test (real single/multi-turn execution through `execute_defense`),
+Campaigns (launch/list/progress against
+`evaluation/results/orchestrator.sqlite3`), Results (campaign records and
+execution traces). Model names shown are display-only — the target and judge
+models are fixed in the runtime configuration.
+
+Evaluation harness:
+
+```bash
+PYTHONPATH=src:. python -m safety_platform.evaluation fetch --out evaluation/data/jbb-v2
+PYTHONPATH=src:. python -m safety_platform.evaluation run   --dataset evaluation/data/jbb-v2/cases.jsonl --db evaluation/results/smoke.sqlite3 --per-label 2
+PYTHONPATH=src:. python -m safety_platform.evaluation report --db evaluation/results/jbb-v2.sqlite3
+```
+
+Environment variables: `SAFETY_UI_SPECULATIVE_ECHO=1` opts the dashboard into
+the speculative-echo probe (default off, runs only after the Tier-1 gate);
+`SAFETY_CAMPAIGN_DB` redirects the campaign store for tests/multi-user setups.
+Live model inference is opt-in and bounded: see
+`tests/integration/test_live_defense_validation.py` (`RUN_LIVE_OLLAMA=1`).

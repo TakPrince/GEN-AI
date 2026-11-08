@@ -294,3 +294,32 @@ async def test_recovered_campaign_summary_matches_uninterrupted_run(env) -> None
     assert untimed(recovered.summary["totals"]) == untimed(clean.summary["totals"])
     assert untimed(recovered.summary["metrics"]) == untimed(clean.summary["metrics"])
     assert recovered.summary["campaign"]["units"]["completed"] == 2
+
+
+def test_store_lists_campaign_runs(tmp_path: Path) -> None:
+    store = CampaignStore(str(tmp_path / "ledger.sqlite3"))
+    try:
+        config = {"dataset": "d", "per_label": 1}
+        store.create(
+            "run-a",
+            kind="single",
+            config=config,
+            artifact_dir="out",
+            plan=(("direct", {"label": "attack"}),),
+        )
+        store.create(
+            "run-b",
+            kind="multi",
+            config=config,
+            artifact_dir="out",
+            plan=(("crescendo", {"label": "attack"}),),
+        )
+
+        runs = store.list_runs()
+
+        assert [run["run_id"] for run in runs] == ["run-a", "run-b"]
+        assert runs[0]["kind"] == "single"
+        assert runs[1]["status"] == "pending"
+        assert runs[0]["config"]["dataset"] == "d"
+    finally:
+        store.close()

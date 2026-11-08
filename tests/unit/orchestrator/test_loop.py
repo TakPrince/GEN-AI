@@ -363,3 +363,61 @@ async def test_write_jsonl_round_trip(tmp_path: Path) -> None:
     assert payload["case_id"] == "attack-001"
     assert payload["judge_complied"] is False
     assert payload["partial_compliance"] is None
+
+
+@pytest.mark.asyncio
+async def test_single_turn_records_target_received_prompt(
+    runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SAFETY_UI_SPECULATIVE_ECHO", "0")
+    completion = _CountingCompletion("greeting from model")
+    judge = _ScriptedJudge()
+
+    records, _summary = await _campaign(
+        runtime, judge, completion, strategies=("direct",)
+    )
+
+    by_case = {r.case_id: r for r in records}
+    # Executed request: exact text sent to the completion callback.
+    assert by_case["benign-001"].target_input == "what is the weather"
+    # Tier 1 blocked: the target never ran, so nothing was received.
+    assert by_case["attack-002"].target_input is None
+
+
+def test_jsonl_round_trip_preserves_target_input(tmp_path: Path) -> None:
+    from safety_platform.orchestrator.loop import AttemptOutcome, write_jsonl
+
+    record = AttemptOutcome(
+        run_id="run-9",
+        timestamp="2026-01-01T00:00:00+00:00",
+        case_id="attack-001",
+        label="attack",
+        attack_category="malware",
+        original_prompt="p",
+        executed_prompt="p",
+        mutation_strategy="direct",
+        outcome="safe",
+        blocked=False,
+        final_route="safe",
+        target_status="executed",
+        raw_response="ok",
+        final_response="ok",
+        judge_complied=True,
+        judge_reason="",
+        judge_error=None,
+        raw_judge_complied=None,
+        raw_judge_error=None,
+        latency_ms=1.0,
+        execution_error=None,
+        failure_stage=None,
+        trace_id="t1",
+        model_metadata=(("target", "stub"),),
+        partial_compliance=None,
+        target_input="sent text",
+    )
+    path = tmp_path / "records.jsonl"
+
+    write_jsonl((record,), path)
+
+    payload = json.loads(path.read_text().splitlines()[0])
+    assert payload["target_input"] == "sent text"

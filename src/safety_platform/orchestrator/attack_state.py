@@ -30,6 +30,9 @@ class TurnRecord:
     execution_error: str | None
     failure_stage: str | None
     timestamp: str
+    # Exact text received by the completion callback (DefenseResult.target_input);
+    # None when the target never ran for this turn.
+    target_input: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -15,7 +15,7 @@ import json
 import random
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -126,11 +126,14 @@ async def run_conversation(
     model_metadata: tuple[tuple[str, str], ...] = (),
     reference_time: str | None = None,
     resume_state: AttackState | None = None,
+    resume_pending: TurnRecord | None = None,
     on_turn_start: Callable[[int], None] | None = None,
+    on_response: Callable[[AttackState, TurnRecord], None] | None = None,
     on_turn_done: Callable[[AttackState], None] | None = None,
 ) -> ScenarioOutcome:
-    """`resume_state` continues a persisted conversation; the hooks let a
-    durable store checkpoint each turn (Task 15)."""
+    """`resume_state` continues a persisted conversation. `resume_pending` is a
+    target response persisted before judging: it is judged, never resent. The
+    hooks let a durable store checkpoint each turn (Tasks 15 and 17)."""
     if escalation not in ESCALATIONS:
         raise ValueError(f"unknown escalation strategy: {escalation!r}")
     timestamp = reference_time or datetime.now(UTC).isoformat()
@@ -158,35 +161,51 @@ async def run_conversation(
             on_turn_done(current)
         return current
 
+    pending = resume_pending
     while state.status == "running" and state.turn_count < state.max_turns:
-        turn = state.turn_count + 1
-        prompt = build_turn_prompt(
-            case.prompt,
-            escalation,
-            turn=turn,
-            history=state.history(),
-            seed=seed + turn,
-        )
-        if on_turn_start is not None:
-            on_turn_start(turn)
-        record, state, blocked = await _execute_turn(
-            runtime,
-            case,
-            state,
-            judge,
-            completion,
-            turn=turn,
-            prompt=prompt,
-            escalation=escalation,
-            timestamp=timestamp,
-            model_metadata=model_metadata,
-        )
-        if record is None:  # execute_defense raised: state already marked failed
-            return _finalize(
-                state, escalation, timestamp, model_metadata, total_latency
+        if pending is None:
+            turn = state.turn_count + 1
+            prompt = build_turn_prompt(
+                case.prompt,
+                escalation,
+                turn=turn,
+                history=state.history(),
+                seed=seed + turn,
+            )
+            if on_turn_start is not None:
+                on_turn_start(turn)
+            response, error = await _defend_turn(
+                runtime,
+                case,
+                state,
+                completion,
+                turn=turn,
+                prompt=prompt,
+                escalation=escalation,
+                timestamp=timestamp,
+            )
+            if response is None:  # execute_defense raised
+                return _finalize(
+                    state.fail(error),
+                    escalation,
+                    timestamp,
+                    model_metadata,
+                    total_latency,
+                )
+            if _is_executed(response) and on_response is not None:
+                on_response(state, response)  # persisted before judging
+        else:
+            response, pending = pending, None
+        record = _judge_turn(response, judge)
+        state = state.add_turn(record)
+        if not _is_executed(record):
+            state = state.fail(
+                "defense_error:"
+                f"{record.failure_stage or record.outcome}:"
+                f"{record.execution_error or 'outcome=error'}"
             )
         total_latency += record.latency_ms
-        consecutive_blocks = consecutive_blocks + 1 if blocked else 0
+        consecutive_blocks = consecutive_blocks + 1 if record.blocked else 0
         # Termination is decided before the checkpoint, so a resumed run never
         # extends a conversation that already ended.
         if record.judge_complied:
@@ -209,19 +228,18 @@ async def run_conversation(
     return outcome
 
 
-async def _execute_turn(
+async def _defend_turn(
     runtime: _CampaignRuntime,
     case: EvaluationCase,
     state: AttackState,
-    judge: _Judger,
     completion: Callable[[str], str],
     *,
     turn: int,
     prompt: str,
     escalation: str,
     timestamp: str,
-    model_metadata: tuple[tuple[str, str], ...],
-) -> tuple[TurnRecord | None, AttackState, bool]:
+) -> tuple[TurnRecord | None, str]:
+    """Target stage only: the received response, before any judging."""
     request = DefenseRequest(
         prompt=prompt,
         request_id=f"{state.run_id}-{case.case_id}-t{turn}",
@@ -249,18 +267,7 @@ async def _execute_turn(
             completion=completion,
         )
     except Exception as exc:
-        return None, state.fail(f"execution_error:{type(exc).__name__}"), False
-    executed = result.error is None and result.outcome != "error"
-    judge_complied: bool | None = None
-    judge_error: str | None = None
-    if executed:
-        try:
-            verdict = judge.judge(prompt, result.final_response or "")
-        except Exception as exc:
-            judge_error = type(exc).__name__
-        else:
-            judge_complied = bool(verdict.complied) if verdict.error is None else None
-            judge_error = verdict.error
+        return None, f"execution_error:{type(exc).__name__}"
     record = TurnRecord(
         turn_number=turn,
         prompt=prompt,
@@ -271,25 +278,34 @@ async def _execute_turn(
         target_status=result.target_status,
         final_response=result.final_response,
         raw_response=result.raw_response,
-        judge_complied=judge_complied,
-        judge_error=judge_error,
+        judge_complied=None,
+        judge_error=None,
         latency_ms=result.latency_ms,
         execution_error=result.error,
         failure_stage=result.failure_stage,
         timestamp=timestamp,
+        target_input=result.target_input,
     )
-    state = state.add_turn(record)
-    if not executed:
-        return (
-            record,
-            state.fail(
-                "defense_error:"
-                f"{result.failure_stage or result.outcome}:"
-                f"{result.error or 'outcome=error'}"
-            ),
-            result.blocked,
-        )
-    return record, state, result.blocked
+    return record, ""
+
+
+def _is_executed(record: TurnRecord) -> bool:
+    return record.execution_error is None and record.outcome != "error"
+
+
+def _judge_turn(record: TurnRecord, judge: _Judger) -> TurnRecord:
+    """Judging stage: a pure function of the received response, so it can resume."""
+    if not _is_executed(record):
+        return record
+    try:
+        verdict = judge.judge(record.prompt, record.final_response or "")
+    except Exception as exc:
+        return replace(record, judge_error=type(exc).__name__)
+    return replace(
+        record,
+        judge_complied=bool(verdict.complied) if verdict.error is None else None,
+        judge_error=verdict.error,
+    )
 
 
 def _conversation_judge(

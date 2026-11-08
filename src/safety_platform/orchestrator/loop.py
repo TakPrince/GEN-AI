@@ -59,6 +59,9 @@ class AttemptOutcome:
     trace_id: str
     model_metadata: tuple[tuple[str, str], ...]
     partial_compliance: None  # binary judge: never fabricated
+    # Exact text received by the completion callback (DefenseResult.target_input);
+    # None when the target never ran.
+    target_input: str | None = None
 
 
 class _CampaignRuntime(Protocol):
@@ -233,6 +236,7 @@ async def _defend_single(
         latency_ms=result.latency_ms,
         failure_stage=result.failure_stage,
         execution_error=result.error,
+        target_input=result.target_input,
     )
     return record
 

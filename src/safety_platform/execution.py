@@ -104,6 +104,10 @@ class DefenseResult:
     # Additive: persistence latency measured separately, not part of decision
     # path; `latency_ms` keeps its end-to-end benchmark semantics.
     telemetry_latency_ms: float = 0.0
+    # Exact text handed to the completion callback; None when the target was
+    # not invoked (blocked, etc.). May equal `prompt` when screening made no
+    # modification.
+    target_input: str | None = None
 
 
 class _DefenseRuntime(Protocol):
@@ -219,6 +223,7 @@ async def execute_defense(
     input_route = Route.ERROR.value
     input_stage = Stage.ROUTER.value
     target_status = "skipped"
+    target_input: str | None = None
     raw_response: str | None = None
     out_route: str | None = None
     out_stage: str | None = None
@@ -252,6 +257,7 @@ async def execute_defense(
             raw_response=raw_response,
             output_guard_route=out_route,
             output_guard_stage=out_stage,
+            target_input=target_input,
             output_guard_latency_ms=out_latency,
             final_route=final_route,
             final_stage=final_stage,
@@ -269,25 +275,6 @@ async def execute_defense(
             routing_drift_score=drift,
             token_anomaly_score=token_anomaly,
         )
-
-    if runtime.echo_probe is not None:
-        echo_status = (await runtime.echo_probe.probe(request.prompt)).status
-        if echo_status == SPECULATIVE_VIOLATING:
-            route = runtime.router.route(
-                context,
-                (
-                    StageDecision(
-                        stage=Stage.ROUTER,
-                        verdict=SafetyVerdict.BLOCK,
-                        reason_codes=("speculative_echo:violating",),
-                    ),
-                ),
-            )
-            observations.append(StageObservation("ML", "SKIP", 0.0, echo_status))
-            input_route = final_route = route.route.value
-            input_stage = final_stage = route.stage.value
-            outcome = "blocked"
-            return await _finalize()
 
     first = await tier1(request.prompt, context)
     observations.append(
@@ -315,6 +302,29 @@ async def execute_defense(
         failure_stage = _failed_stage(decisions)
         outcome = "blocked" if route.route is Route.REFUSED else "error"
         return await _finalize()
+
+    # Echo probe is opt-in only and must never see an unscreened prompt: it
+    # receives the Tier 1 redaction and cannot run when Tier 1 blocked.
+    if runtime.echo_probe is not None:
+        echo_status = (
+            await runtime.echo_probe.probe(first.redacted_text or request.prompt)
+        ).status
+        if echo_status == SPECULATIVE_VIOLATING:
+            route = runtime.router.route(
+                context,
+                (
+                    StageDecision(
+                        stage=Stage.ROUTER,
+                        verdict=SafetyVerdict.BLOCK,
+                        reason_codes=("speculative_echo:violating",),
+                    ),
+                ),
+            )
+            observations.append(StageObservation("ML", "SKIP", 0.0, echo_status))
+            input_route = final_route = route.route.value
+            input_stage = final_stage = route.stage.value
+            outcome = "blocked"
+            return await _finalize()
 
     second = await tier2(request.prompt, context)
     prompt_bytes = len(request.prompt.encode("utf-8", "surrogatepass"))
@@ -411,8 +421,9 @@ async def execute_defense(
         outcome = "blocked" if route.route is Route.REFUSED else "error"
         return await _finalize()
 
+    target_input = route.safe_text or request.prompt
     try:
-        raw = await asyncio.to_thread(completion, route.safe_text or request.prompt)
+        raw = await asyncio.to_thread(completion, target_input)
     except Exception as exc:  # target failure, never counted as a defense success
         error = type(exc).__name__
         failure_stage = "target"

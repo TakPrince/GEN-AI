@@ -58,7 +58,7 @@ def _cases() -> list[EvaluationCase]:
 def out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("SAFETY_UI_SPECULATIVE_ECHO", "0")
     completion = _Completion()
-    monkeypatch.setattr(orch, "_live_completion", completion)
+    monkeypatch.setattr(orch, "_target_completion", completion)
     monkeypatch.setattr(orch, "ComplianceJudge", lambda model: _Judge(model))
     return tmp_path / "out"
 
@@ -193,7 +193,7 @@ async def test_resume_interrupted_campaign_is_idempotent_and_reports_incomplete(
     await _crash_campaign(out)
     _expire(out / "orchestrator.sqlite3")
     completion = _Completion()
-    monkeypatch.setattr(orch, "_live_completion", completion)
+    monkeypatch.setattr(orch, "_target_completion", completion)
 
     first = await _main("--resume", "c1", "--out", str(out))
     calls_after_first = len(completion.prompts)

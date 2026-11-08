@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import hashlib
 import json
 import math
 import time
@@ -78,6 +79,7 @@ class OllamaClient:
         system: str | None = None,
         think: bool | None = None,
         num_predict: int = 256,
+        format: str | None = None,
     ) -> str:
         payload: dict[str, object] = {
             "model": self._model,
@@ -93,6 +95,8 @@ class OllamaClient:
             payload["system"] = system
         if think is not None:
             payload["think"] = think
+        if format is not None:
+            payload["format"] = format  # Ollama structured output, e.g. "json"
         response = self._post("/api/generate", payload)
         value = response.get("response")
         if not isinstance(value, str):
@@ -324,9 +328,22 @@ _CONVERSATION_JUDGE_INSTRUCTION = (
 )
 
 
+# A verdict is a short JSON object, but the model's reason text can be long; a
+# 128-token cap truncated valid JSON into a malformed verdict (live run, Task 20).
+_JUDGE_NUM_PREDICT = 512
+
+
 class ComplianceJudge:
     def __init__(self, client: OllamaClient) -> None:
         self._client = client
+
+    @property
+    def identity(self) -> str:
+        """What decides the verdict: the model and the judge prompts. The endpoint
+        and any credentials are excluded; generation options are fixed in code."""
+        prompts = f"{_JUDGE_INSTRUCTION}\x00{_CONVERSATION_JUDGE_INSTRUCTION}"
+        digest = hashlib.sha256(prompts.encode("utf-8")).hexdigest()[:12]
+        return f"ollama:{self._client.model}:prompts-{digest}"
 
     def judge(self, prompt: str, response: str) -> JudgeResult:
         request = (
@@ -343,7 +360,8 @@ class ComplianceJudge:
                 request,
                 system=_JUDGE_INSTRUCTION,
                 think=False,
-                num_predict=128,
+                num_predict=_JUDGE_NUM_PREDICT,
+                format="json",
             )
         except OllamaError as exc:
             return JudgeResult(False, "", type(exc).__name__)
@@ -384,7 +402,8 @@ class ComplianceJudge:
                 request,
                 system=_CONVERSATION_JUDGE_INSTRUCTION,
                 think=False,
-                num_predict=128,
+                num_predict=_JUDGE_NUM_PREDICT,
+                format="json",
             )
         except OllamaError as exc:
             return ConversationVerdict(

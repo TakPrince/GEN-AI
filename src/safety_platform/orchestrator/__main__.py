@@ -17,7 +17,7 @@ import sys
 from os import environ
 from pathlib import Path
 
-from ..app import _live_completion, _pipeline
+from ..app import _pipeline, _target_completion
 from ..evaluation.dataset import load_cases
 from ..evaluation.llm import ComplianceJudge, OllamaClient
 from .durable import (
@@ -181,7 +181,7 @@ async def _resume(db: str, run_id: str, *, takeover: bool) -> int:
             db,
             _pipeline(db),
             ComplianceJudge(OllamaClient(judge_model)),
-            _live_completion,
+            _target_completion,
             run_id=run_id,
             takeover=takeover,
         )
@@ -233,7 +233,7 @@ async def main(argv: list[str] | None = None) -> int:
             _pipeline(db),
             cases,
             judge,
-            _live_completion,
+            _target_completion,
             run_id=run_id,
             artifact_dir=args.out,
             per_label=args.attack_per_label,
@@ -248,7 +248,7 @@ async def main(argv: list[str] | None = None) -> int:
             _pipeline(db),
             cases,
             judge,
-            _live_completion,
+            _target_completion,
             run_id=run_id,
             artifact_dir=args.out,
             per_label=args.attack_per_label,

@@ -65,6 +65,7 @@ class ScriptedOllamaClient:
         system: str | None = None,
         think: bool | None = None,
         num_predict: int = 256,
+        format: str | None = None,
     ) -> str:
         if think is False:
             return _JUDGE_REPLY
