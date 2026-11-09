@@ -1,4 +1,4 @@
-"""Tier-3 output-arbitration calibration from stored pilot responses (Task 8)."""
+"""Tier-3 output-arbitration calibration from stored pilot responses."""
 
 from __future__ import annotations
 

@@ -20,6 +20,12 @@ from ...config.registry import (
 from ...evaluation.llm import _json_object
 from .classifier import ClassifierClient, Tier3Classifier, Tier3Result
 
+# Gate configuration for consumers that adopt the multi-signal
+# policy: Tier 3 may also run on a Tier 2 PASS when the router escalates
+# (execution.py / cascade.py). The bare TierGates() default keeps the legacy
+# ambiguity-only behavior for connectors built elsewhere.
+MULTI_SIGNAL_GATES = TierGates(tier3_requires_ambiguity=False)
+
 _INSTRUCTION = (
     "Classify the user message as safe or unsafe. Return only one word: safe or unsafe."
 )
@@ -285,6 +291,7 @@ def _violation_confidence(output: str) -> float:
 
 
 __all__ = [
+    "MULTI_SIGNAL_GATES",
     "GuardClassifier",
     "OllamaGenerateRequest",
     "OllamaGuardConfig",

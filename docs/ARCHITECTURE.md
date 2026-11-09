@@ -1,6 +1,13 @@
 # Architecture: Local-First Multi-Turn LLM Red-Teaming
 
-**Status:** Proposed. Initial Tier 1 scaffold implemented.
+**Status:** Implemented. The input cascade now ships deterministic Tier 1
+signatures, a multi-signal Tier 3 escalation policy and a direction-specific
+output detector profile; measured evidence lives in
+`docs/GUARDRAIL_EVALUATION.md`. Honest capability notes: Tier 2 uses a
+local hashing-based embedder (not a neural sentence encoder) and the shipped
+Tier 3 is a deterministic demo heuristic — Llama Guard / PromptGuard models
+are benchmarked once (see `docs/TIER3_MODEL_BENCHMARK.md`) but are NOT
+integrated into the live defense.
 
 **Scope:** Single-host research system: adaptive attacks, symmetric defense, best-effort telemetry, local evaluation. Not a production security boundary.
 
@@ -57,7 +64,7 @@ before returning:
   calls and return `target_status="skipped"`, `raw_response=None`.
 - `DefenseRequest` carries `prompt`, `request_id`, optional `attack_id` /
   `attack_category` and metadata; these are echoed into `DefenseResult` so a
-  red-team caller can correlate attacks with outcomes (Task 9/10 hook).
+  red-team caller can correlate attacks with outcomes.
 - `DefenseResult` is the shared result contract (`DEFENSE_RESULT_CONTRACT`
   lists its field names): request identity (`request_id`, `trace_id`,
   `prompt`, `metadata`), defense decisions (`input_route`, `input_stage`,
@@ -82,7 +89,7 @@ before returning:
   (dashboard: `app._live_completion`; red-team engine: its own `OllamaClient`
   call or test stub), keeping the boundary free of any specific transport.
 
-### Single-Turn Red-Team Orchestrator (Task 9, `src/safety_platform/orchestrator/`)
+### Single-Turn Red-Team Orchestrator (`src/safety_platform/orchestrator/`)
 
 The red-team engine drives attacks *through* `execute_defense`; it never calls
 the target model directly, so no code path exists that bypasses the pipeline.
@@ -104,14 +111,14 @@ the target model directly, so no code path exists that bypasses the pipeline.
   never fabricated (`partial_compliance=None`).
 - `metrics.py` — reuses the evaluation report denominators: ASR is computed
   over judged, non-errored attack attempts (Wilson CIs via
-  `evaluation/report.py`); benign FPR excludes errored executions and is
+  `src/safety_platform/evaluation/report.py`); benign FPR excludes errored executions and is
   reported separately; judge failures count as missing measurements with the
   error rate surfaced alongside.
 - CLI: `python -m safety_platform.orchestrator --dataset
   evaluation/data/jbb-v2/cases.jsonl --attack-per-label 5` writes JSONL
   records and a summary JSON under `evaluation/results/`.
 
-### Multi-Turn Red-Team Engine (Task 10, `orchestrator/{attack_state,escalation,multi}.py`)
+### Multi-Turn Red-Team Engine (`orchestrator/{attack_state,escalation,multi}.py`)
 
 Multi-turn conversations extend the single-turn engine; every turn still goes
 through `execute_defense` and no code path calls the target model directly.
@@ -139,16 +146,19 @@ through `execute_defense` and no code path calls the target model directly.
   `partial_compliance`, `refused`, `non_compliant`; `unscorable` for failed
   scenarios, `judge_error` for judge failures — never fabricated). A
   blocked turn makes zero target calls; the next turn continues through
-  the boundary again. `run_conversation_campaign` picks `per_label` attacks,
+  the boundary again. **Limitation:** conversation-level risk accumulation
+  (weighting a turn by prior blocked turns) is NOT implemented — each turn
+  is judged independently; only the deterministic escalation templates see
+  prior-turn outcomes. `run_conversation_campaign` picks `per_label` attacks,
   assigns escalations from `(run_id, escalations, seed)`, and keeps a
   campaign-level per-scenario failure from aborting the batch.
 - `metrics.py — aggregate_conversations` — conversation scorable
   denominator excludes judge-error and unscorable/failed scenarios; ASR,
   full-compliance (alias), partial-compliance and refusal rates carry
-  Wilson CIs; turn-level ASR reuses the Task 9 binary convention over
+  Wilson CIs; turn-level ASR reuses the single-turn binary convention over
   judged non-errored turns; mean turns-to-success counts only
   conversations with at least one judged-compliant turn; per-category
-  rows separate conversations from scorable subsets. Task 9 single-turn
+  rows separate conversations from scorable subsets. Single-turn
   metric semantics are untouched.
 - CLI (mode=multi): `python -m safety_platform.orchestrator --mode multi
   --dataset evaluation/data/jbb-v2/cases.jsonl --attack-per-label N
@@ -162,35 +172,45 @@ One orchestration contract; separate input/output profiles and thresholds.
 
 | Tier | Detector | Verdicts | Escalation |
 | --- | --- | --- | --- |
-| 1 | Regex, deny-list | pass, block; output redact | Block stops cascade |
-| 2 | Cosine centroid match | pass, block, ambiguous | Ambiguous only |
-| 3 | Local Llama Guard | pass, block, error | Terminal |
+| 1 | Regex, deny-list, deterministic harmful-signature rules (`src/safety_platform/guardrails/tier1/rules.py`) | pass, block; output redact | Block stops cascade |
+| 2 | Cosine centroid match (hashing-based local embedder) | pass, block, ambiguous | Ambiguous, or when another signal escalates |
+| 3 | Deterministic demo heuristic (`_LocalClassifier`, NOT a safety model) | pass, block, error | Terminal |
 
-- Ascending order: Tier 1 always; Tier 2 unless blocked; Tier 3 only on ambiguity.
+- Ascending order: Tier 1 always; Tier 2 unless blocked; Tier 3 runs when
+  Tier 2 says `AMBIGUOUS` **or** the ML router asks for escalation
+  (`MULTI_SIGNAL_GATES`): a Tier 2 PASS no longer short-circuits escalation.
+- Direction profiles: the input cascade calibrates on attack prompts; the
+  output cascade (`CascadeRuntime.vector_output`, `output_train_cases`)
+  calibrates on unsafe-output examples. Output Tier 1 also applies redaction.
 - Tier 3 context: bounded, deterministic, versioned.
 - Exception, timeout, malformed output, invalid policy: fail-closed; record error.
 - Block dominates redact; redaction is non-terminal.
 
 ## Async Telemetry Queue
 
-| Lane | Payload | Bound | Saturation |
-| --- | --- | --- | --- |
-| Decision | Summaries, outcomes | 4,096 events | Drop newest; critical loss |
-| Evidence | Detector details | 8,192 events | Drop newest |
-| Capture | Transcripts | 512 events/64 MiB | Truncate/drop; incomplete |
-
+- One bounded `asyncio.Queue` (default 4,096 events, `maxsize` configurable);
+  events carry a `lane` tag (`decision`, `evidence`, `capture`) as metadata,
+  persisted with each row. On saturation the newest event is dropped and a
+  drop counter increments — telemetry never blocks, retries, or alters a verdict.
 - Non-blocking enqueue; one consumer; 256 events/250 ms batches.
-- Single writer; idempotent by event/batch ID.
-- Raw content: capture only. Skipped tiers: explicit records.
+- Single writer; inserts are `INSERT OR IGNORE` keyed by `event_id`; persist
+  failures recover into a dead-letter file rather than losing the event stream silently.
+- Raw content: capture lane only. Skipped tiers: explicit records.
 - Completeness = received/expected critical events; loss counters persist independently.
 
 ## WAL Evaluation Store
 
-- SQLite WAL; `NORMAL` sync; foreign keys; one writer; bounded readers; local disk only.
-- Versioning: `pipeline_manifest`, `dataset_case`, `attack_run`, `conversation`, `turn`.
-- Decisions: `stage_verdict`, `inference_observation`, `turn_outcome`, `transcript`.
-- Measurement: `evaluation_label`, `ingest_batch`, `telemetry_loss`, `metric_snapshot`, `schema_migration`.
-- `metric_snapshot`: immutable; numerator, denominator, sample, completeness, versions, split.
-- Metrics: run ASR; benign FPR; p50/p95/p99 guardrail overhead; Tier-3 invocation per direction; partial compliance; completeness/loss.
-- Reports stratify guardrail version, backend/model, and split.
-- Calibration/held-out stay separate; incomplete windows provisional; missing records never fabricated.
+- SQLite WAL; `NORMAL` sync; foreign keys; one writer; local disk only.
+- Telemetry store (`src/safety_platform/telemetry/db_sink.py`): stage events keyed by
+  `event_id`, indexed by conversation, lanes persisted per row.
+- Evaluation store (`src/safety_platform/evaluation/runner.py`): `run` (detached run
+  metadata: target/embed/tier3/judge model, dataset digest, config JSON),
+  `run_result` (per-case defense dispositions, judged verdicts,
+  `judge_error`, raw response), `embedding_cache` (seeded into the cascade).
+- Campaign store (`src/safety_platform/orchestrator/durable.py`): `campaign`, `campaign_unit`,
+  `judge_attempt` with lease-based recovery so an interrupted campaign resumes.
+- Reports (`src/safety_platform/evaluation/report.py`): run ASR; benign FPR with Wilson CIs;
+  p50/p95/p99 guardrail latency; Tier-3 invocation rate; judge errors;
+  per-category stratification.
+- Calibration/held-out stay separate; incomplete runs marked
+  (`completed=False`); missing records never fabricated.

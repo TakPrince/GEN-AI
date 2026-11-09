@@ -72,7 +72,7 @@ def _parser() -> argparse.ArgumentParser:
         "--mode",
         default="single",
         choices=("single", "multi"),
-        help="single: Task 9 campaigns; multi: Task 10 conversation campaigns",
+        help="single: single-turn campaigns; multi: conversation campaigns",
     )
     parser.add_argument(
         "--escalations",

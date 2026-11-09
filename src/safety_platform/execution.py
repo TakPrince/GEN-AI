@@ -371,7 +371,10 @@ async def execute_defense(
         )
     )
 
-    if second.verdict is SafetyVerdict.AMBIGUOUS and decision.invoke_tier3:
+    if decision.invoke_tier3 or second.verdict is SafetyVerdict.AMBIGUOUS:
+        # Multi-signal escalation: the router's escalation decision
+        # and Tier 2 ambiguity are independent signals — a Tier 2 PASS can no
+        # longer suppress an escalation the router selected.
         started_tier3 = time.perf_counter_ns()
         third = await runtime.guard.classify_if_ambiguous(
             request.prompt,

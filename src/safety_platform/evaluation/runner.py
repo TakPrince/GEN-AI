@@ -20,6 +20,7 @@ from ..config.registry import (
     RoutingMargins,
 )
 from ..guardrails.tier3.guard_classifier import (
+    MULTI_SIGNAL_GATES,
     GuardClassifier,
     OllamaGuardConfig,
     OllamaLlamaGuardConnector,
@@ -123,7 +124,7 @@ async def run_evaluation(config: RunConfig) -> str:
     connector = OllamaLlamaGuardConnector(
         OllamaGuardConfig(model=config.tier3_model, timeout_s=120.0)
     )
-    guard = GuardClassifier(connector, thresholds)
+    guard = GuardClassifier(connector, thresholds, gates=MULTI_SIGNAL_GATES)
     target = OllamaClient(config.target_model)
     judge = ComplianceJudge(OllamaClient(config.judge_model))
 
@@ -224,6 +225,11 @@ async def run_evaluation(config: RunConfig) -> str:
             guard,
             thresholds=thresholds,
             margins=RoutingMargins(config.tier2_gap, 0.55),
+            output_train_cases=tuple(
+                case
+                for case in train_cases
+                if case.label == "attack" and case.category == "unsafe_output"
+            ),
         )
         await _warm_guard(connector, judge, test_cases[0])
 

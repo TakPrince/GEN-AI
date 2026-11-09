@@ -17,7 +17,8 @@ from ..config.registry import (
     Stage,
 )
 from ..guardrails.router import ResponseRouter, StageDecision
-from ..guardrails.tier1.regex_filter import RegexAction, RegexFilter, RegexRule
+from ..guardrails.tier1.regex_filter import RegexFilter
+from ..guardrails.tier1.rules import defense_regex_filter
 from ..guardrails.tier2.vector_filter import Centroid, VectorFilter
 from ..guardrails.tier3.guard_classifier import GuardClassifier
 from ..research.ml_router import (
@@ -52,6 +53,11 @@ class CascadeRuntime:
     guard: GuardClassifier
     ml_router: ModelDrivenRouter
     router: ResponseRouter
+    # Optional output-direction detector profile: output text is
+    # compared against centroids built from labeled *output* examples, never
+    # silently against the input attack centroids. None keeps the legacy
+    # shared-centroid behavior and must be reported honestly.
+    vector_output: VectorFilter | None = None
 
     async def run(
         self,
@@ -63,6 +69,11 @@ class CascadeRuntime:
         started = time.perf_counter_ns()
         tier3_invoked = False
         echo_status: str | None = None
+        vector = (
+            self.vector_output
+            if context.direction is Direction.OUTPUT and self.vector_output
+            else self.vector
+        )
         first = self.regex.evaluate(text)
         decisions = [
             StageDecision(
@@ -94,7 +105,7 @@ class CascadeRuntime:
                 )
                 return _outcome(route, started, False, 0.0, echo_status)
 
-        second = self.vector.evaluate(text)
+        second = vector.evaluate(text)
         decisions.append(
             StageDecision(
                 stage=Stage.TIER2,
@@ -117,7 +128,9 @@ class CascadeRuntime:
                 prompt_bytes=len(text.encode("utf-8", "surrogatepass")),
             )
         )
-        if second.verdict is SafetyVerdict.AMBIGUOUS and decision.invoke_tier3:
+        if decision.invoke_tier3 or second.verdict is SafetyVerdict.AMBIGUOUS:
+            # Multi-signal escalation: independent signals, not a
+            # single Tier-2 ambiguity gate.
             third = await self.guard.classify_if_ambiguous(
                 text,
                 context,
@@ -150,7 +163,16 @@ def build_cascade(
     *,
     thresholds: CascadeThresholds | None = None,
     margins: RoutingMargins | None = None,
+    output_train_cases: Sequence[EvaluationCase] | None = None,
+    output_thresholds: CascadeThresholds | None = None,
 ) -> CascadeRuntime:
+    """Build the cascade runtime.
+
+    `output_train_cases` carries labeled *output-direction* examples (unsafe
+    model-response text); when provided, the output direction gets its own
+    VectorFilter and centroids, and the output cascade stops reusing input
+    attack centroids. Omitting it keeps the documented legacy behavior.
+    """
     attacks = tuple(case for case in train_cases if case.label == "attack")
     if not attacks:
         raise ValueError("training split must contain attack cases")
@@ -159,18 +181,28 @@ def build_cascade(
     centroids = tuple(
         Centroid(case.case_id, embedder.embed(case.prompt)) for case in attacks
     )
-    regex = RegexFilter(
-        (
-            RegexRule("block.ignore_previous", r"ignore\s+(all\s+)?previous"),
-            RegexRule(
-                "block.system_prompt",
-                r"(reveal|show|print).{0,24}(system prompt|hidden instructions)",
-            ),
-            RegexRule("redact.secret", r"secret=\w+", action=RegexAction.REDACT),
-        ),
-        max_input_bytes=16384,
-    )
     vector = VectorFilter(embedder, centroids, active_thresholds, active_margins)
+    profile: VectorFilter | None = None
+    if output_train_cases:
+        output_attacks = tuple(
+            case for case in output_train_cases if case.label == "attack"
+        )
+        if output_attacks:
+            output_centroids = tuple(
+                Centroid(case.case_id, embedder.embed(case.prompt))
+                for case in output_attacks
+            )
+            profile = VectorFilter(
+                embedder,
+                output_centroids,
+                (
+                    DEFAULT_CASCADE_THRESHOLDS
+                    if output_thresholds is None
+                    else (output_thresholds)
+                ),
+                active_margins,
+            )
+    regex = defense_regex_filter(max_input_bytes=16384)
     router_model = benchmark_router()
     return CascadeRuntime(
         regex=regex,
@@ -178,6 +210,7 @@ def build_cascade(
         guard=guard,
         ml_router=ModelDrivenRouter(Tier3BypassRouter(router_model)),
         router=ResponseRouter(),
+        vector_output=profile,
     )
 
 

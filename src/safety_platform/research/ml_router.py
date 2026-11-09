@@ -257,9 +257,9 @@ def _sigmoid(value: float) -> float:
 def benchmark_router() -> LogisticRegressionRouter:
     """Calibrated bypass-router configuration used by the cascade and dashboard.
 
-    Single source of truth; provenance and decision record live in Readme §9
-    and docs/IMPLEMENTATION_PLAN_V2.md (Task 7 / F-HIGH-2). Do not copy the
-    literals elsewhere.
+    Single source of truth; provenance and decision record live in Readme §9.
+    The weights are heuristically calibrated, not learned by training on data.
+    Do not copy the literals elsewhere.
     """
     return LogisticRegressionRouter(
         weights=(1.5, 1.0, -0.3, 3.0, 0.2),

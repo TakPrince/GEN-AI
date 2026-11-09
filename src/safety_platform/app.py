@@ -52,15 +52,15 @@ from safety_platform.execution import (  # noqa: E402
 from safety_platform.execution import _digest as _digest_imported  # noqa: E402
 from safety_platform.guardrails.router import ResponseRouter  # noqa: E402
 from safety_platform.guardrails.tier1.regex_filter import (  # noqa: E402
-    RegexAction,
     RegexFilter,
-    RegexRule,
 )
+from safety_platform.guardrails.tier1.rules import defense_regex_filter  # noqa: E402
 from safety_platform.guardrails.tier2.vector_filter import (  # noqa: E402
     Centroid,
     VectorFilter,
 )
 from safety_platform.guardrails.tier3.guard_classifier import (  # noqa: E402
+    MULTI_SIGNAL_GATES,
     GuardClassifier,
 )
 from safety_platform.orchestrator.durable import (  # noqa: E402
@@ -177,6 +177,9 @@ class _Pipeline:
     consumer: TelemetryConsumer
     cascade: CascadeRuntime
     echo_probe: SpeculativeEchoProbe | None = None
+    # Honest classifier-mode label surfaced in the UI: the dashboard Tier 3 is
+    # the deterministic local heuristic, not a real Ollama safety model.
+    tier3_mode: str = "demo heuristic"
 
 
 class _HashingEmbedder:
@@ -223,21 +226,7 @@ def _speculative_echo_probe() -> SpeculativeEchoProbe | None:
 
 def _build_pipeline(database: str) -> _Pipeline:
     embedder = _HashingEmbedder()
-    regex = RegexFilter(
-        (
-            RegexRule("block.ignore_previous", r"ignore\s+(all\s+)?previous"),
-            RegexRule(
-                "block.system_prompt",
-                r"(reveal|show|print).{0,24}(system prompt|hidden instructions)",
-            ),
-            RegexRule("redact.secret", r"secret=\w+", action=RegexAction.REDACT),
-            RegexRule(
-                "redact.email",
-                r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
-                action=RegexAction.REDACT,
-            ),
-        )
-    )
+    regex = defense_regex_filter(max_input_bytes=16384)
     vector = VectorFilter(
         embedder,
         (
@@ -260,7 +249,7 @@ def _build_pipeline(database: str) -> _Pipeline:
         _MARGINS,
     )
     model = benchmark_router()
-    guard = GuardClassifier(_LocalClassifier(), _THRESHOLDS)
+    guard = GuardClassifier(_LocalClassifier(), _THRESHOLDS, gates=MULTI_SIGNAL_GATES)
     ml_router = ModelDrivenRouter(Tier3BypassRouter(model))
     router = ResponseRouter()
     sink = SqliteTelemetrySink(database)
@@ -550,9 +539,12 @@ def _demo_database_path() -> Path:
 
 def _render_topbar() -> None:
     st.columns(4, gap="small")  # keeps the main body width stable
+    pipeline = _pipeline(str(_demo_database_path()))
     st.markdown(
         f"**AI Safety Lab** · *LLM Red-Teaming* — "
-        f"{_ollama_status()} · target `{_COMPLETION_MODEL}` · judge `{_JUDGE_MODEL}`",
+        f"{_ollama_status()} · target `{_COMPLETION_MODEL}` (real Ollama) · "
+        f"judge `{_JUDGE_MODEL}` (real Ollama) · "
+        f"tier3 `{pipeline.tier3_mode}` local classifier",
     )
 
 
@@ -583,7 +575,10 @@ def _pipeline_row(turn: _Turn) -> None:
         ("Tier 1", tier1.verdict if tier1 else "skipped"),
         ("Tier 2", tier2.verdict if tier2 else "skipped"),
         ("ML Router", f"p={turn.router_probability:.2f}"),
-        ("Tier 3", tier3.verdict if tier3 else "bypass"),
+        (
+            "Tier 3 (demo heuristic)" if tier3 else "Tier 3",
+            f"{tier3.verdict} (demo)" if tier3 else "bypass",
+        ),
         ("Target", target_label),
         ("Output Guard", oguard.verdict if oguard else "skipped"),
     )
@@ -640,6 +635,20 @@ def _render_execution_details(turn: _Turn) -> None:
                         "Error": error,
                     }
                     for stage, verdict, reason, error in turn.decisions
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+        if turn.stages:
+            st.caption("Per-stage latency (ms, as measured by the boundary)")
+            st.dataframe(
+                [
+                    {
+                        "Stage": row.stage,
+                        "Latency ms": f"{row.latency_ms:.1f}",
+                        "Signal": row.signal,
+                    }
+                    for row in turn.stages
                 ],
                 width="stretch",
                 hide_index=True,

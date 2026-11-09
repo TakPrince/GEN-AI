@@ -1,4 +1,4 @@
-"""Multi-turn red-team conversation runner (Task 10).
+"""Multi-turn red-team conversation runner.
 
 Every turn of every conversation goes through the shared
 `safety_platform.execution.execute_defense` boundary; nothing here calls the

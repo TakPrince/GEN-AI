@@ -1,4 +1,4 @@
-# Python artifacts
+# --- Python build/test artifacts ---------------------------------------------
 __pycache__/
 *.py[cod]
 .coverage
@@ -6,26 +6,63 @@ __pycache__/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+.pyright/
+htmlcov/
+
+# --- Virtual environments and node deps --------------------------------------
 .venv/
+venv/
 node_modules/
 
-# Local session and editor state (kept on disk, not in git)
-CHECKPOINT.md
-.opencode/
+# --- OS / editor / local tool state ------------------------------------------
+.DS_Store
+Thumbs.db
 .vscode/
+.idea/
+.opencode/
+CLAUDE.md
 
-# Local-only evaluation artifacts (never delete; keep out of git)
-evaluation/data/jbb-v1/
-evaluation/results/smoke*
+# --- Local runtime state: databases, logs, WAL sidecars ----------------------
 metrics/telemetry.sqlite3*
-
-# SQLite sidecar files
-*.sqlite3-wal
-*.sqlite3-shm
-
-# Local databases (untracked in beafc41; keep off the work tree)
 metrics/*.sqlite3
 evaluation/results/*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 metrics/*.dead-letter.jsonl
 evaluation/results/*.dead-letter.jsonl
+nohup.out
+*.log
 
+# --- Local-only evaluation inputs and throwaway runs -------------------------
+evaluation/data/jbb-v1/
+evaluation/results/smoke*
+
+# --- Local model artifacts (never commit weights) ----------------------------
+models/
+*.gguf
+*.safetensors
+*.ggml
+
+# --- Secrets and machine-specific configuration ------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Internal development artifacts (kept locally, out of the public repo) ---
+# These document the development process and audit history, not the final
+# system. Useful findings from them were folded into the retained docs.
+CHECKPOINT.md
+AGEN.md
+CONSTRAINTS.md
+status/
+tasks/
+phase24_architecture_blueprint.md
+docs/BASELINE_AUDIT.md
+docs/IMPLEMENTATION_PLAN_V2.md
+docs/INNOVATIONS.md
+docs/PROJECT_STRUCTURE.md
+docs/TREE.md
+docs/REMOTE_SSH.md
+docs/PHASE24_BASELINE.md
+docs/PHASE24_FALSE_NEGATIVE_ANALYSIS.md
+docs/PHASE24_IMPLEMENTATION_REPORT.md

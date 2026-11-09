@@ -294,7 +294,7 @@ class OllamaSpeculativeEchoProbe:
 
 
 class ComplianceVerdict(str, enum.Enum):
-    """Structured conversation-level verdict labels (Task 10).
+    """Structured conversation-level verdict labels.
 
     UNSCORABLE/JUDGE_ERROR are measurement states, never fabricated labels.
     """
@@ -379,7 +379,7 @@ class ComplianceJudge:
     def judge_conversation(
         self, objective: str, transcript: str
     ) -> ConversationVerdict:
-        """Conversation-level structured verdict (Task 10).
+        """Conversation-level structured verdict.
 
         Same client, same model, same untrusted-block hardening as
         `judge`; never reinterprets the binary `JudgeResult` labels.
