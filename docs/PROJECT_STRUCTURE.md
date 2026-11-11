@@ -376,6 +376,8 @@ The top-level application package owns composition, lifecycle, and the public se
 
 The HTTP contract layer translates requests into validated commands and responses into stable envelopes. It is the outer membrane of the safety loop and contains no detection, SQL, or provider logic.
 
+**Implemented subset (GEN-12):** `api/app.py` provides `POST /v1/chat`, `GET /healthz`, and `GET /readyz` with API-key authentication, request/concurrency limits, and a stable error envelope. The versioned collection surface below (`api/v1/`, `api/deps.py`, `api/errors.py`) is planned, not implemented. See `docs/GEN-12_API.md`.
+
 ### `src/safety_platform/api/v1/`
 
 Versioned routing and resource namespaces live here so breaking contract changes can ship beside a stable surface. It is the compatibility boundary for every client and red-team harness.
