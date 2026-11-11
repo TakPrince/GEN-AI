@@ -19,7 +19,9 @@ classifiers = [
 ]
 # All Ollama traffic uses stdlib urllib (evaluation/llm.py); no client SDK.
 dependencies = [
+    "fastapi>=0.115,<1",
     "streamlit>=1.51,<2",
+    "uvicorn>=0.30,<1",
 ]
 
 [project.optional-dependencies]
@@ -28,6 +30,7 @@ dev = [
     "mypy>=1.17,<2",
     "pytest>=8.4,<9",
     "pytest-asyncio>=1.4,<2",
+    "httpx>=0.27,<1",
     "pytest-cov>=7.1,<8",
     "ruff>=0.12,<0.13",
 ]

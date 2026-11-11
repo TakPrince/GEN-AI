@@ -120,6 +120,64 @@ async def test_connector_rejects_malformed_output() -> None:
 
 
 @pytest.mark.asyncio
+async def test_connector_does_not_treat_a_safe_prefixed_sentence_as_pass() -> None:
+    connector = OllamaLlamaGuardConnector(
+        OllamaGuardConfig(),
+        StubTransport("safe to provide the requested exploit in full"),
+    )
+
+    with pytest.raises(OllamaGuardError, match="malformed_verdict"):
+        await connector.score("prompt", context())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output", ["safe.", "`unsafe`", "SAFE!"])
+async def test_connector_accepts_one_word_verdict_formatting(output: str) -> None:
+    connector = OllamaLlamaGuardConnector(
+        OllamaGuardConfig(),
+        StubTransport(output),
+    )
+
+    score = await connector.score("prompt", context())
+
+    assert score == (1.0 if "unsafe" in output.lower() else 0.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case_id", "model_output", "expected_score"),
+    [
+        ("attack-010", "unsafe", 1.0),
+        ("attack-024", "unsafe", 1.0),
+        ("attack-038", "unsafe", 1.0),
+        ("benign-018", "safe", 0.0),
+        ("benign-019", "safe", 0.0),
+        ("benign-020", "safe", 0.0),
+    ],
+)
+async def test_historical_cases_reach_classifier_verbatim(
+    case_id: str, model_output: str, expected_score: float
+) -> None:
+    # Wiring regression only: the mocked response exercises parsing and input
+    # preservation, not a claim that the real model returns this verdict.
+    from safety_platform.evaluation.dataset import load_cases
+
+    case = next(
+        c
+        for c in load_cases("evaluation/data/jbb-v2/cases.jsonl")
+        if c.case_id == case_id
+    )
+    transport = StubTransport(model_output)
+    connector = OllamaLlamaGuardConnector(OllamaGuardConfig(), transport)
+
+    score = await connector.score(case.prompt, context())
+
+    assert score == expected_score
+    assert transport.request is not None
+    assert case.prompt in transport.request.prompt
+
+
+@pytest.mark.asyncio
 async def test_connector_rejects_oversized_prompt() -> None:
     connector = OllamaLlamaGuardConnector(
         OllamaGuardConfig(max_prompt_bytes=4),
@@ -579,8 +637,39 @@ async def test_guard_classifier_rejects_invalid_tier2_verdict() -> None:
         )
 
 
+def test_classifier_instruction_keeps_harm_criteria_and_one_word_output() -> None:
+    from safety_platform.guardrails.tier3.guard_classifier import _INSTRUCTION
+
+    lowered = _INSTRUCTION.lower()
+    assert "not on sensitive words alone" in lowered
+    assert (
+        "functional operational help for cyber intrusion, malware, weapons" in lowered
+    )
+    assert "return only one word: safe or unsafe" in lowered
+
+
 def test_json_object_parser_is_shared_with_evaluation() -> None:
     from safety_platform.evaluation import llm
     from safety_platform.guardrails.tier3 import guard_classifier
 
     assert guard_classifier._json_object is llm._json_object
+
+
+def test_tier3_module_imports_without_evaluation_loaded_first() -> None:
+    # Regression: a fresh import of the Tier 3 connector used to hit a circular
+    # import (guard_classifier -> evaluation -> runner -> guard_classifier).
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import safety_platform.guardrails.tier3.guard_classifier",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={"PYTHONPATH": "src", "PATH": ""},
+    )
+    assert result.returncode == 0, result.stderr

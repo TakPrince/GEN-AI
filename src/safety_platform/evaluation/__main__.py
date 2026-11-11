@@ -95,6 +95,21 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("evaluation/calibration/tier3-arbitration.json"),
     )
+
+    manifest = commands.add_parser("manifest")
+    manifest.add_argument("--db", type=Path, required=True)
+    manifest.add_argument("--run-id", required=True)
+    manifest.add_argument("--artifact", type=Path, action="append", default=[])
+    manifest.add_argument(
+        "--out",
+        type=Path,
+        help="default: <db parent>/<run-id>.manifest.json",
+    )
+    manifest.add_argument("--root", type=Path, default=Path("."))
+
+    preflight = commands.add_parser("preflight")
+    preflight.add_argument("--manifest", type=Path, required=True)
+    preflight.add_argument("--root", type=Path, default=Path("."))
     return parser
 
 
@@ -187,6 +202,40 @@ def main(argv: Sequence[str] | None = None) -> None:
             json.dumps(artifact, indent=2) + "\n", encoding="utf-8"
         )
         print(json.dumps(artifact["decision"]))
+        return
+    if arguments.command == "manifest":
+        from .manifest import ManifestError, build_manifest, write_manifest
+
+        try:
+            document = build_manifest(
+                arguments.db,
+                arguments.run_id,
+                artifacts=tuple(arguments.artifact),
+                root=arguments.root,
+            )
+        except ManifestError as error:
+            print(error)
+            raise SystemExit(2) from error
+        destination = arguments.out or (
+            arguments.db.parent / f"{arguments.run_id}.manifest.json"
+        )
+        try:
+            print(write_manifest(document, destination))
+        except ManifestError as error:
+            print(error)
+            raise SystemExit(2) from error
+        return
+    if arguments.command == "preflight":
+        from .manifest import ManifestError, preflight
+
+        try:
+            result = preflight(arguments.manifest, root=arguments.root)
+        except ManifestError as error:
+            print(error)
+            raise SystemExit(2) from error
+        print(json.dumps(result, indent=2, sort_keys=True))
+        if result["mismatches"]:
+            raise SystemExit(1)
         return
     active = load_report(str(arguments.db), run_id=arguments.run_id)
     print(render_markdown(active))

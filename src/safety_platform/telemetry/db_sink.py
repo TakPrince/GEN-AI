@@ -123,7 +123,7 @@ class SqliteTelemetrySink:
     ) -> int:
         total = 0
         while stop is None or not stop.is_set():
-            total += await self.drain_batch(bus)
+            total += await self.drain_batch(bus, stop=stop)
         return total
 
     async def drain_batch(
@@ -131,12 +131,20 @@ class SqliteTelemetrySink:
         bus: AsyncTelemetryBus,
         *,
         limit: int | None = None,
+        stop: asyncio.Event | None = None,
     ) -> int:
         max_events = self._batch_size if limit is None else limit
         if not isinstance(max_events, int) or max_events <= 0:
             raise ValueError("limit must be a positive integer")
 
-        events = [await bus.receive()]
+        first: StageEvent | None
+        if stop is None:
+            first = await bus.receive()
+        else:
+            first = await _receive_or_stop(bus, stop)
+        if first is None:  # stopped with an empty queue: nothing to flush
+            return 0
+        events = [first]
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._max_batch_wait
         while len(events) < max_events:
@@ -167,6 +175,25 @@ class SqliteTelemetrySink:
         connection.execute("PRAGMA busy_timeout=5000")
         connection.execute("PRAGMA foreign_keys=ON")
         return connection
+
+
+async def _receive_or_stop(
+    bus: AsyncTelemetryBus, stop: asyncio.Event
+) -> StageEvent | None:
+    """Wait for one event or the stop signal, so shutdown never blocks on an
+    empty queue."""
+    receive = asyncio.create_task(bus.receive())
+    stopper = asyncio.create_task(stop.wait())
+    try:
+        done, _ = await asyncio.wait(
+            (receive, stopper), return_when=asyncio.FIRST_COMPLETED
+        )
+        return receive.result() if receive in done else None
+    finally:
+        for task in (receive, stopper):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(receive, stopper, return_exceptions=True)
 
 
 def _row(event: StageEvent) -> tuple[object, ...]:

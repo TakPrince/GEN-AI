@@ -220,17 +220,19 @@ async def main(argv: list[str] | None = None) -> int:
     environ["SAFETY_UI_SPECULATIVE_ECHO"] = "0"
     judge = ComplianceJudge(OllamaClient(args.judge_model))
     run_id = _run_stamp()
+    runtime = _pipeline(db)
     # Announced before any external request so an interrupted run can be resumed.
     print(f"campaign: {run_id}", flush=True)
     base_metadata = (
         ("target", "qwen3:8b"),
         ("judge", args.judge_model),
         ("dataset", dataset_name),
+        ("tier3_mode", runtime.tier3_mode),
     )
     if args.mode == "multi":
         result = await start_multi(
             db,
-            _pipeline(db),
+            runtime,
             cases,
             judge,
             _target_completion,
@@ -245,7 +247,7 @@ async def main(argv: list[str] | None = None) -> int:
     else:
         result = await start_single(
             db,
-            _pipeline(db),
+            runtime,
             cases,
             judge,
             _target_completion,

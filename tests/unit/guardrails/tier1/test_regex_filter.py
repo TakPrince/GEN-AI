@@ -175,3 +175,33 @@ def test_redacted_text_is_never_empty_for_redact_verdict() -> None:
         assert result.verdict is RegexVerdict.REDACT
         assert result.redacted_text
         assert "[REDACTED]" in result.redacted_text
+
+
+@pytest.mark.parametrize(
+    "leaked",
+    [
+        "Use the key sk-live-123456 for the request.",
+        "AWS access key AKIAABCDEFGHIJKLMNOP was printed.",
+    ],
+)
+def test_credential_shapes_are_redacted_by_default_rules(leaked: str) -> None:
+    from safety_platform.config.registry import SafetyVerdict
+    from safety_platform.guardrails.tier1.rules import defense_regex_filter
+
+    result = defense_regex_filter().evaluate(leaked)
+
+    assert result.verdict is SafetyVerdict.REDACT
+    assert result.redacted_text is not None
+    assert "sk-live-123456" not in result.redacted_text
+    assert "AKIAABCDEFGHIJKLMNOP" not in result.redacted_text
+
+
+def test_credential_redaction_does_not_match_ordinary_hyphenated_words() -> None:
+    from safety_platform.config.registry import SafetyVerdict
+    from safety_platform.guardrails.tier1.rules import defense_regex_filter
+
+    result = defense_regex_filter().evaluate(
+        "The task-manager and disk-usage risk-based report is ready."
+    )
+
+    assert result.verdict is SafetyVerdict.PASS

@@ -16,6 +16,7 @@ from ..config.registry import (
     SafetyVerdict,
     Stage,
 )
+from ..guardrails.canary import CanaryDetector, CanaryMatch, ConversationTail
 from ..guardrails.router import ResponseRouter, StageDecision
 from ..guardrails.tier1.regex_filter import RegexFilter
 from ..guardrails.tier1.rules import defense_regex_filter
@@ -58,6 +59,21 @@ class CascadeRuntime:
     # silently against the input attack centroids. None keeps the legacy
     # shared-centroid behavior and must be reported honestly.
     vector_output: VectorFilter | None = None
+    # Live output guard: a model response is the only unvetted artifact, so the
+    # live path always consults Tier 3 on it. The harness keeps the measured
+    # conditional escalation (default False).
+    tier3_on_output: bool = False
+    # Known confidential values: an exact/transformed echo in OUTPUT is a leak,
+    # blocked fail-closed. None disables the check (evaluation harness default).
+    canary: CanaryDetector | None = None
+    # Cross-turn carry of delivered output, so a secret split across turns is
+    # seen. Requires `canary`; committed only by execute_defense after delivery.
+    canary_tail: ConversationTail | None = None
+
+    def commit_delivered(self, context: ExecutionContext, delivered: str) -> None:
+        """Record text the caller actually returned, for cross-turn canary checks."""
+        if self.canary_tail is not None:
+            self.canary_tail.commit(context.conversation_id, delivered)
 
     async def run(
         self,
@@ -85,6 +101,31 @@ class CascadeRuntime:
             )
         ]
         if first.verdict in (SafetyVerdict.BLOCK, SafetyVerdict.ERROR):
+            route = self.router.route(context, decisions)
+            return _outcome(route, started, False, 0.0)
+
+        # Known-value leak: a canary in a generated response is never returned.
+        leaks: tuple[CanaryMatch, ...] = ()
+        if self.canary is not None and context.direction is Direction.OUTPUT:
+            prior = ""
+            cumulative: list[CanaryMatch] = []
+            if self.canary_tail is not None:
+                prior = self.canary_tail.prefix(context.conversation_id)
+                cumulative = [
+                    CanaryMatch(canary_id, "coverage")
+                    for canary_id in self.canary_tail.blocked_canaries(
+                        context.conversation_id, text
+                    )
+                ]
+            leaks = (*self.canary.find(prior + text), *cumulative)
+        if leaks:
+            decisions.append(
+                StageDecision(
+                    stage=Stage.TIER1,
+                    verdict=SafetyVerdict.BLOCK,
+                    reason_codes=tuple(f"canary:{match.canary_id}" for match in leaks),
+                )
+            )
             route = self.router.route(context, decisions)
             return _outcome(route, started, False, 0.0)
 
@@ -128,7 +169,12 @@ class CascadeRuntime:
                 prompt_bytes=len(text.encode("utf-8", "surrogatepass")),
             )
         )
-        if decision.invoke_tier3 or second.verdict is SafetyVerdict.AMBIGUOUS:
+        always_check = self.tier3_on_output and context.direction is Direction.OUTPUT
+        if (
+            decision.invoke_tier3
+            or second.verdict is SafetyVerdict.AMBIGUOUS
+            or always_check
+        ):
             # Multi-signal escalation: independent signals, not a
             # single Tier-2 ambiguity gate.
             third = await self.guard.classify_if_ambiguous(

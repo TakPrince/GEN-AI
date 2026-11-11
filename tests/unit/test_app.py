@@ -45,7 +45,8 @@ async def test_local_pipeline_routes_all_cascade_paths(
     tier3 = await app._evaluate(pipeline, "write malware", context)
 
     assert (blocked.route, blocked.stage) == ("refused", "tier1")
-    assert (safe.route, safe.stage) == ("safe", "tier2")
+    # Live output guard always consults Tier 3 on the response (see tier3_on_output).
+    assert (safe.route, safe.stage) == ("safe", "tier3")
     assert redacted.route == "partial"
     assert (tier3.route, tier3.stage, tier3.tier3_invoked) == (
         "refused",
@@ -633,6 +634,10 @@ def test_live_pipeline_tier2_embedder_is_hashing(
 
     pipeline = app_module._pipeline(str(tmp_path / "h.sqlite3"))
     assert isinstance(pipeline.vector._embedder, app_module._HashingEmbedder)
+    # Parity discipline: the demo backend must be truthfully labelled the same
+    # way the Tier 3 mode is (never a heuristic dressed as a real component).
+    assert pipeline.tier2_mode == "hash-trick demo"
+    assert pipeline.tier3_mode != "unknown"
 
 
 # --- Task 22: dashboard navigation and pages --------------------------------

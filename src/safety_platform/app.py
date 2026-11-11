@@ -7,6 +7,7 @@ import math
 import os
 import re
 import sys
+import threading
 import uuid
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from typing import cast
 from urllib.request import urlopen
 
 import streamlit as st
+from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 # Self-locate the src/ tree and the repo root (metrics package) so the dashboard
 # launches from any cwd or invocation, not only via `make ui`'s PYTHONPATH.
@@ -50,6 +52,10 @@ from safety_platform.execution import (  # noqa: E402
     vector_signal,
 )
 from safety_platform.execution import _digest as _digest_imported  # noqa: E402
+from safety_platform.guardrails.canary import (  # noqa: E402
+    CanaryDetector,
+    ConversationTail,
+)
 from safety_platform.guardrails.router import ResponseRouter  # noqa: E402
 from safety_platform.guardrails.tier1.regex_filter import (  # noqa: E402
     RegexFilter,
@@ -62,6 +68,9 @@ from safety_platform.guardrails.tier2.vector_filter import (  # noqa: E402
 from safety_platform.guardrails.tier3.guard_classifier import (  # noqa: E402
     MULTI_SIGNAL_GATES,
     GuardClassifier,
+    OllamaGuardConfig,
+    OllamaLlamaGuardConnector,
+    OllamaTransport,
 )
 from safety_platform.orchestrator.durable import (  # noqa: E402
     CampaignStore,
@@ -156,6 +165,7 @@ class _Turn:
     error: str | None = None
     failure_stage: str | None = None
     latency_ms: float = 0.0
+    tier3_mode: str = "unknown"
     decisions: tuple[tuple[str, str, str, str], ...] = ()
     judge_complied: bool | None = None
     judge_error: str | None = None
@@ -176,10 +186,14 @@ class _Pipeline:
     bus: AsyncTelemetryBus
     consumer: TelemetryConsumer
     cascade: CascadeRuntime
+    # Honest classifier-mode label surfaced in the UI ("ollama:<model>" or the
+    # explicitly labelled "demo heuristic"); never a heuristic dressed as a model.
+    tier3_mode: str
+    # Honest Tier 2 backend label (accepted Task 20 decision: the live backend
+    # stays the deterministic hashing trick — self-consistent lexical space,
+    # unlike the evaluation runner's semantic Ollama embeddings).
+    tier2_mode: str
     echo_probe: SpeculativeEchoProbe | None = None
-    # Honest classifier-mode label surfaced in the UI: the dashboard Tier 3 is
-    # the deterministic local heuristic, not a real Ollama safety model.
-    tier3_mode: str = "demo heuristic"
 
 
 class _HashingEmbedder:
@@ -208,6 +222,52 @@ class _LocalClassifier:
         return min(0.99, 0.62 + 0.18 * matches)
 
 
+_TIER3_MODEL = "qwen3:8b"
+# Cold load + output arbitration measured 6-60 s on this CPU; harness uses 120 s too.
+_TIER3_TIMEOUT_S = 120.0
+
+
+def _tier3_guard(
+    transport: OllamaTransport | None = None,
+) -> tuple[GuardClassifier, str]:
+    """Live Tier 3 is the real local classifier; the heuristic is opt-in demo only.
+
+    Timeouts, unreachable models, and malformed output surface as ERROR verdicts,
+    which the router fail-closes.
+    """
+    mode = os.environ.get("SAFETY_UI_TIER3", "ollama")
+    if mode == "heuristic":
+        guard = GuardClassifier(
+            _LocalClassifier(), _THRESHOLDS, gates=MULTI_SIGNAL_GATES
+        )
+        return guard, "demo heuristic"
+    if mode != "ollama":
+        raise ValueError("SAFETY_UI_TIER3 must be 'ollama' or 'heuristic'")
+    connector = OllamaLlamaGuardConnector(
+        OllamaGuardConfig(model=_TIER3_MODEL, timeout_s=_TIER3_TIMEOUT_S),
+        transport,
+    )
+    return GuardClassifier(connector, _THRESHOLDS, gates=MULTI_SIGNAL_GATES), (
+        f"ollama:{_TIER3_MODEL}"
+    )
+
+
+def _canary_detector() -> CanaryDetector | None:
+    """Opt-in known-value leak protection: `SAFETY_UI_CANARY=a,b,...`."""
+    raw = os.environ.get("SAFETY_UI_CANARY", "").strip()
+    if not raw:
+        return None
+    secrets = tuple(part.strip() for part in raw.split(",") if part.strip())
+    # Partial-fragment protection is on by default at a conservative 16 chars
+    # (0 disables); it cannot fire for secrets shorter than the fragment size.
+    partial = os.environ.get("SAFETY_UI_CANARY_PARTIAL_MIN", "16").strip()
+    partial_min = int(partial) if partial.isdigit() else 16
+    return CanaryDetector(
+        {f"canary-{index}": value for index, value in enumerate(secrets)},
+        partial_min_fragment=partial_min,
+    )
+
+
 class _Collector:
     def __init__(self) -> None:
         self.events: list[TelemetryEvent] = []
@@ -225,6 +285,7 @@ def _speculative_echo_probe() -> SpeculativeEchoProbe | None:
 
 
 def _build_pipeline(database: str) -> _Pipeline:
+    canary = _canary_detector()
     embedder = _HashingEmbedder()
     regex = defense_regex_filter(max_input_bytes=16384)
     vector = VectorFilter(
@@ -249,7 +310,7 @@ def _build_pipeline(database: str) -> _Pipeline:
         _MARGINS,
     )
     model = benchmark_router()
-    guard = GuardClassifier(_LocalClassifier(), _THRESHOLDS, gates=MULTI_SIGNAL_GATES)
+    guard, tier3_mode = _tier3_guard()
     ml_router = ModelDrivenRouter(Tier3BypassRouter(model))
     router = ResponseRouter()
     sink = SqliteTelemetrySink(database)
@@ -278,13 +339,31 @@ def _build_pipeline(database: str) -> _Pipeline:
             guard=guard,
             ml_router=ml_router,
             router=router,
+            tier3_on_output=True,
+            canary=canary,
+            canary_tail=None if canary is None else ConversationTail(canary),
         ),
         echo_probe=_speculative_echo_probe(),
+        tier3_mode=tier3_mode,
+        tier2_mode="hash-trick demo",
     )
 
 
-@st.cache_resource(show_spinner=False)
+def _cache_session_key() -> str:
+    # Cached resources are process-global; keying by session keeps each
+    # dashboard session's bus/consumer private (GEN-08). Bare-mode callers
+    # (tests, scripts) share one stable key.
+    if get_script_run_ctx() is None:
+        return "bare"
+    return _session_id()
+
+
 def _pipeline(database: str) -> _Pipeline:
+    return _session_pipeline(database, _cache_session_key())
+
+
+@st.cache_resource(show_spinner=False)
+def _session_pipeline(database: str, session_id: str) -> _Pipeline:
     return _build_pipeline(database)
 
 
@@ -340,10 +419,33 @@ def _dataset_files() -> list[str]:
     return sorted(str(p) for p in root.glob("*/cases.jsonl"))
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+# GEN-14: bound concurrent target inference so N dashboard sessions cannot
+# spawn N simultaneous model calls and exhaust CPU/memory. Queue wait is
+# bounded; a timed-out slot fails closed (outcome=error, never a false allow).
+_TARGET_SLOTS = threading.BoundedSemaphore(
+    _env_positive_int("SAFETY_UI_TARGET_CONCURRENCY", 2)
+)
+_TARGET_QUEUE_TIMEOUT_S = float(
+    os.environ.get("SAFETY_UI_TARGET_QUEUE_TIMEOUT_S", "60") or 60
+)
+
+
 def _target_completion(prompt: str) -> str:
-    completion = OllamaClient(_COMPLETION_MODEL).generate(
-        prompt, think=False, num_predict=16
-    )
+    if not _TARGET_SLOTS.acquire(timeout=_TARGET_QUEUE_TIMEOUT_S):
+        raise OllamaError("target_queue_timeout")
+    try:
+        completion = OllamaClient(_COMPLETION_MODEL).generate(
+            prompt, think=False, num_predict=16
+        )
+    finally:
+        _TARGET_SLOTS.release()
     if not completion or not completion.strip():
         raise OllamaError("empty_target_completion")
     return completion.strip()
@@ -394,6 +496,7 @@ async def _evaluate(
         db_error=result.telemetry_error,
         outcome=result.outcome,
         blocked=result.blocked,
+        tier3_mode=runtime.tier3_mode,
         target_status=result.target_status,
         target_input=result.target_input,
         raw_response=result.raw_response,
@@ -544,6 +647,7 @@ def _render_topbar() -> None:
         f"**AI Safety Lab** · *LLM Red-Teaming* — "
         f"{_ollama_status()} · target `{_COMPLETION_MODEL}` (real Ollama) · "
         f"judge `{_JUDGE_MODEL}` (real Ollama) · "
+        f"tier2 `{pipeline.tier2_mode}` · "
         f"tier3 `{pipeline.tier3_mode}` local classifier",
     )
 
@@ -576,8 +680,8 @@ def _pipeline_row(turn: _Turn) -> None:
         ("Tier 2", tier2.verdict if tier2 else "skipped"),
         ("ML Router", f"p={turn.router_probability:.2f}"),
         (
-            "Tier 3 (demo heuristic)" if tier3 else "Tier 3",
-            f"{tier3.verdict} (demo)" if tier3 else "bypass",
+            f"Tier 3 · {turn.tier3_mode}" if tier3 else "Tier 3",
+            f"{tier3.verdict}" if tier3 else "bypass",
         ),
         ("Target", target_label),
         ("Output Guard", oguard.verdict if oguard else "skipped"),

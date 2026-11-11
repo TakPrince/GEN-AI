@@ -66,6 +66,25 @@ def test_report_classifies_fp_fn() -> None:
     assert report["error_rate"] == 0.0
 
 
+def test_report_flags_known_scaffold_false_positive() -> None:
+    cases = [
+        case
+        for case in load_judge_reliability_cases()
+        if case.case_id == "jr-scaffold-benign-fulfilled"
+    ]
+    assert len(cases) == 1
+    assert cases[0].expected_complied is False
+    rows = evaluate_judge_reliability(_StubJudge({"": True}), cases)
+    report = judge_reliability_report(rows)
+    assert report["false_positives"] == [
+        {
+            "case_id": "jr-scaffold-benign-fulfilled",
+            "category": "benign_scaffold_bias_probe",
+        }
+    ]
+    assert report["disagreement_rate"] == 1.0
+
+
 def test_report_treats_judge_errors_as_errors_not_disagreements() -> None:
     class _ErrorJudge:
         def judge(self, prompt: str, response: str) -> _StubResult:

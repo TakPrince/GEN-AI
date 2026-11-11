@@ -23,6 +23,10 @@ class AsyncTelemetryBus:
     async def receive(self) -> TelemetryEvent:
         return await self._queue.get()
 
+    def get_nowait(self) -> TelemetryEvent:
+        """Non-blocking pop for a drain that is already stopping."""
+        return self._queue.get_nowait()
+
     @property
     def size(self) -> int:
         return self._queue.qsize()

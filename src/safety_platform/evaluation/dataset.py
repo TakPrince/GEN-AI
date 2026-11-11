@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import csv
+import datetime
 import hashlib
 import json
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
@@ -11,6 +14,9 @@ from urllib.request import Request, urlopen
 
 _JBB_DATASET = "JailbreakBench/JBB-Behaviors"
 _JBB_URL = "https://datasets-server.huggingface.co/rows"
+_XSTEST_REPO = "paul-rottger/xstest"
+XSTEST_SEED = 20261109
+_XSTEST_LABELS = {"unsafe": "attack", "safe": "benign"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +171,94 @@ def fetch_jbb_dataset(
         "digest": dataset_digest(cases_path),
         "counts": counts,
         "source_split_size": {"attack": 300, "benign": 100},
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return cases_path
+
+
+def build_xstest_cases(
+    source_csv: str | Path,
+    destination: str | Path,
+    *,
+    revision: str,
+    train_per_label: int = 20,
+    seed: int = XSTEST_SEED,
+    overwrite: bool = False,
+) -> Path:
+    """Derive frozen cases from the unmodified XSTest CSV.
+
+    unsafe -> attack (direct harmful requests), safe -> benign (over-refusal
+    probes, the FPR set). The split is a seeded shuffle per label; the seed,
+    source digest and revision are recorded in manifest.json.
+    """
+    if train_per_label <= 0:
+        raise ValueError("train_per_label must be positive")
+    root = Path(destination)
+    cases_path = root / "cases.jsonl"
+    manifest_path = root / "manifest.json"
+    if not overwrite and (cases_path.exists() or manifest_path.exists()):
+        raise ValueError(
+            "refusing to overwrite frozen dataset artifacts; "
+            "pass overwrite=True to rebuild"
+        )
+    source = Path(source_csv)
+    with source.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    grouped: dict[str, list[dict[str, str]]] = {"attack": [], "benign": []}
+    for row in rows:
+        label = _XSTEST_LABELS.get(row.get("label", "").strip())
+        if label is None:
+            raise ValueError(f"unknown XSTest label: {row.get('label')!r}")
+        grouped[label].append(row)
+
+    rng = random.Random(seed)
+    lines: list[str] = []
+    counts: dict[str, dict[str, int]] = {}
+    for label in ("attack", "benign"):
+        ordered = sorted(grouped[label], key=lambda row: int(row["id"]))
+        if len(ordered) <= train_per_label:
+            raise ValueError(f"not enough {label} rows for train_per_label")
+        rng.shuffle(ordered)
+        counts[label] = {
+            "train": train_per_label,
+            "test": len(ordered) - train_per_label,
+        }
+        for index, row in enumerate(ordered):
+            case = {
+                "case_id": f"xstest-{label}-{int(row['id']):03d}",
+                "prompt": row["prompt"].strip(),
+                "label": label,
+                "category": row["type"].strip(),
+                "behavior": (row["focus"] or row["type"]).strip(),
+                "split": "train" if index < train_per_label else "test",
+                "source": f"{_XSTEST_REPO}:xstest_prompts.csv:id={row['id']}",
+            }
+            lines.append(json.dumps(case, ensure_ascii=False, separators=(",", ":")))
+
+    root.mkdir(parents=True, exist_ok=True)
+    cases_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    manifest = {
+        "dataset": "XSTest",
+        "dataset_url": f"https://github.com/{_XSTEST_REPO}",
+        "source_file": "xstest_prompts.csv",
+        "revision": revision,
+        "acquired_on": datetime.date.today().isoformat(),
+        "license": "CC-BY-4.0",
+        "source_sha256": dataset_digest(source),
+        "source_bytes": source.stat().st_size,
+        "digest": dataset_digest(cases_path),
+        "seed": seed,
+        "train_per_label": train_per_label,
+        "counts": counts,
+        "label_mapping": {"unsafe": "attack", "safe": "benign"},
+        "purpose": (
+            "benign set for over-refusal/FPR; unsafe set tests direct-request "
+            "refusal only, not jailbreak resistance"
+        ),
+        "builder": "safety_platform.evaluation.dataset.build_xstest_cases",
     }
     manifest_path.write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",

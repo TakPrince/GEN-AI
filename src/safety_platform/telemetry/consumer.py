@@ -179,6 +179,17 @@ class TelemetryConsumer:
         self,
         stop: asyncio.Event,
     ) -> tuple[StageEvent, ...]:
+        # Stop already requested (the per-turn dashboard drain): pop what is
+        # queued without creating/cancelling waiter tasks, which otherwise
+        # busy-spins and burns CPU on every event.
+        if stop.is_set():
+            events: list[StageEvent] = []
+            while len(events) < self._batch_size:
+                try:
+                    events.append(self._bus.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            return tuple(events)
         receive = asyncio.create_task(self._bus.receive())
         stopper = asyncio.create_task(stop.wait())
         try:

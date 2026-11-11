@@ -17,6 +17,7 @@ from ..config.registry import (
     DEFAULT_CASCADE_THRESHOLDS,
     CascadeThresholds,
     Direction,
+    Route,
     RoutingMargins,
 )
 from ..guardrails.tier3.guard_classifier import (
@@ -225,11 +226,10 @@ async def run_evaluation(config: RunConfig) -> str:
             guard,
             thresholds=thresholds,
             margins=RoutingMargins(config.tier2_gap, 0.55),
-            output_train_cases=tuple(
-                case
-                for case in train_cases
-                if case.label == "attack" and case.category == "unsafe_output"
-            ),
+            # No labeled *response* corpus exists (dataset categories are input
+            # prompts, not generated response text), so do not fabricate an
+            # output profile from input prompts. Output safety relies on the
+            # always-on Tier 3 output check on the live path.
         )
         await _warm_guard(connector, judge, test_cases[0])
 
@@ -294,7 +294,9 @@ async def run_evaluation(config: RunConfig) -> str:
             )
 
             output_outcome: CascadeOutcome | None = None
-            if not input_blocked:
+            # An input guard failure is unscorable: never vet the response after it.
+            input_errored = input_outcome.route == Route.ERROR.value
+            if not input_blocked and not input_errored:
                 output_outcome = await cascade.run(
                     raw,
                     make_context(case, Direction.OUTPUT),

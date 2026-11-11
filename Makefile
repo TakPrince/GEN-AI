@@ -3,7 +3,7 @@ PYTHON ?= python
 # Targets: test (193-case validation pipeline) | coverage | lint | ui (split-screen
 # Streamlit dashboard) | app | report | eval-data | eval-smoke | eval | clean
 
-.PHONY: test coverage lint ui app eval-data eval-smoke eval report clean
+.PHONY: test coverage lint ui app api eval-data eval-smoke eval report clean
 
 test:
 	$(PYTHON) -m pytest -q
@@ -20,6 +20,9 @@ ui: app
 
 app:
 	PYTHONPATH=src:. $(PYTHON) -m streamlit run src/safety_platform/app.py
+
+api:
+	PYTHONPATH=src $(PYTHON) -m safety_platform.api
 
 eval-data:
 	PYTHONPATH=src:. $(PYTHON) -m safety_platform.evaluation fetch --out evaluation/data/jbb-v2

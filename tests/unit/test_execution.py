@@ -9,6 +9,9 @@ import pytest
 
 from safety_platform import app
 from safety_platform.config.registry import ExecutionContext
+from safety_platform.guardrails.tier3.guard_classifier import (
+    OllamaGenerateRequest,
+)
 
 
 class _CountingCompletion:
@@ -67,10 +70,12 @@ async def test_safe_request_executes_target_with_structured_result(
     assert result.target_status == "executed"
     assert result.raw_response == "greeting from the model"
     assert result.final_response == "greeting from the model"
-    assert (result.final_route, result.final_stage) == ("safe", "tier2")
+    # Input screening stops at Tier 2; the live output guard always vets the
+    # response with Tier 3 (CascadeRuntime.tier3_on_output): final stage is tier3.
+    assert (result.final_route, result.final_stage) == ("safe", "tier3")
     assert result.input_route == "safe"
     assert result.router_probability > 0.0
-    assert result.tier3_invoked is False
+    assert result.tier3_invoked is True
     assert result.latency_ms > 0.0
     assert result.error is None and result.failure_stage is None
     assert result.request_id == "r1"
@@ -100,6 +105,42 @@ async def test_input_block_never_reaches_target(
     assert result.final_route == "refused"
     assert result.final_response == REFUSAL_TEXT
     assert result.failure_stage is None
+
+
+@pytest.mark.asyncio
+async def test_oversized_input_fails_closed_before_target(
+    runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SAFETY_UI_SPECULATIVE_ECHO", "0")
+    from safety_platform.execution import REFUSAL_TEXT
+
+    completion = _CountingCompletion()
+    result = await _run(runtime, "a" * 16385, completion)
+
+    assert completion.calls == []
+    assert result.target_status == "skipped"
+    assert result.outcome == "error"
+    assert result.final_response == REFUSAL_TEXT
+    assert result.failure_stage == "tier1"
+    assert result.telemetry_persisted is True
+
+
+@pytest.mark.asyncio
+async def test_malformed_unicode_input_fails_closed_before_target(
+    runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SAFETY_UI_SPECULATIVE_ECHO", "0")
+    from safety_platform.execution import REFUSAL_TEXT
+
+    completion = _CountingCompletion()
+    result = await _run(runtime, "bad \ud800 text", completion)
+
+    assert completion.calls == []
+    assert result.target_status == "skipped"
+    assert result.outcome == "error"
+    assert result.final_response == REFUSAL_TEXT
+    assert result.failure_stage == "tier1"
+    assert "UnicodeEncodeError" not in (result.error or "")
 
 
 @pytest.mark.asyncio
@@ -143,6 +184,8 @@ async def test_target_failure_is_never_reported_as_defense(
     assert result.raw_response is None
     assert result.error == "ValueError"
     assert result.failure_stage == "target"
+    # Telemetry and the UI read final_route: a failed target must never look "safe".
+    assert result.final_route == "error"
 
 
 @pytest.mark.asyncio
@@ -393,6 +436,7 @@ async def test_output_guard_failure_is_error_not_safe(
     assert result.outcome == "error"
     assert result.failure_stage == "output_guard"
     assert result.error == "RuntimeError"
+    assert result.final_route == "error"  # never reported as a safe route
     assert result.final_response == REFUSAL_TEXT  # never the unvetted output
     assert result.raw_response == "Paris."  # kept for forensics only
 
@@ -585,3 +629,100 @@ async def test_target_failure_records_attempted_target_input(
     assert result.target_status != "executed"
     assert result.target_input == "hello there"
     assert boom.calls == ["hello there"]
+
+
+# --- Tier 3 live wiring: real connector, fail-closed, labelled heuristic ----
+
+
+class _ScriptedTransport:
+    """Injected Ollama transport: returns a canned output or raises."""
+
+    def __init__(self, output: str = "", error: BaseException | None = None) -> None:
+        self.output = output
+        self.error = error
+        self.requests: list[OllamaGenerateRequest] = []
+
+    async def generate(self, request: OllamaGenerateRequest) -> str:
+        self.requests.append(request)
+        if self.error is not None:
+            raise self.error
+        return self.output
+
+
+def _tier3_context() -> ExecutionContext:
+    return ExecutionContext("trace", "turn", "conversation")
+
+
+@pytest.mark.asyncio
+async def test_live_tier3_default_uses_real_classifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from safety_platform.config.registry import SafetyVerdict
+
+    monkeypatch.delenv("SAFETY_UI_TIER3", raising=False)
+    transport = _ScriptedTransport(output="unsafe")
+    guard, mode = app._tier3_guard(transport)
+
+    assert mode == "ollama:qwen3:8b"
+    result = await guard.classify_if_ambiguous(
+        "ambiguous prompt", _tier3_context(), SafetyVerdict.AMBIGUOUS
+    )
+    assert result is not None and result.verdict is SafetyVerdict.BLOCK
+    assert transport.requests[0].model == "qwen3:8b"  # real model, not a phrase count
+    assert transport.requests[0].timeout_s == app._TIER3_TIMEOUT_S
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transport",
+    [
+        _ScriptedTransport(error=TimeoutError("read timed out")),
+        _ScriptedTransport(error=ConnectionRefusedError("ollama down")),
+        _ScriptedTransport(output="I think maybe"),
+        _ScriptedTransport(output="   "),
+    ],
+    ids=["timeout", "unreachable", "malformed-verdict", "empty"],
+)
+async def test_live_tier3_failures_are_error_never_pass(
+    transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from safety_platform.config.registry import SafetyVerdict
+
+    monkeypatch.setenv("SAFETY_UI_TIER3", "ollama")
+    guard, _ = app._tier3_guard(transport)
+    result = await guard.classify_if_ambiguous(
+        "ambiguous prompt", _tier3_context(), SafetyVerdict.AMBIGUOUS
+    )
+    assert result is not None
+    assert result.verdict is SafetyVerdict.ERROR
+    assert result.error
+
+
+def test_live_tier3_rejects_unknown_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SAFETY_UI_TIER3", "llama-guard-magic")
+    with pytest.raises(ValueError, match="SAFETY_UI_TIER3"):
+        app._tier3_guard()
+
+
+def test_heuristic_mode_is_labelled_as_demo(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SAFETY_UI_TIER3", "heuristic")
+    _, mode = app._tier3_guard()
+    assert mode == "demo heuristic"
+
+
+@pytest.mark.asyncio
+async def test_unsafe_output_is_checked_by_tier3_without_router_signal(
+    runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression: an unsafe response used to route "safe" at Tier 2 (input-centroid
+    # similarity ~0.09) with Tier 3 never consulted, so no model judged the output.
+    monkeypatch.setenv("SAFETY_UI_SPECULATIVE_ECHO", "0")
+    from safety_platform.execution import REFUSAL_TEXT
+
+    completion = _CountingCompletion("Here is a ransomware script that encrypts files.")
+    result = await _run(runtime, "What is the capital of France?", completion)
+
+    assert result.target_status == "executed"
+    assert result.output_guard_stage == "tier3"
+    assert result.final_route == "refused"
+    assert result.final_response == REFUSAL_TEXT

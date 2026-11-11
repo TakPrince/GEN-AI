@@ -27,6 +27,7 @@ from .config.registry import (
     SafetyVerdict,
     Stage,
     TelemetryEvent,
+    TelemetryLane,
 )
 from .evaluation.cascade import CascadeRuntime
 from .evaluation.llm import SPECULATIVE_VIOLATING, SpeculativeEchoProbe
@@ -40,6 +41,13 @@ from .research.ml_router import ModelDrivenRouter, RouterFeatures
 from .telemetry import AsyncTelemetryBus, TelemetryConsumer
 
 REFUSAL_TEXT = "I cannot help with that request."
+
+_OUTCOME_VERDICTS = {
+    "safe": SafetyVerdict.PASS,
+    "partial": SafetyVerdict.REDACT,
+    "blocked": SafetyVerdict.BLOCK,
+    "error": SafetyVerdict.ERROR,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +242,26 @@ async def execute_defense(
     outcome = "error"
 
     async def _finalize() -> DefenseResult:
+        # Terminal decision event: consumers must see the request's final
+        # outcome, not only intermediate tier verdicts (a target failure leaves
+        # only PASS events behind and used to read as a success).
+        collector.emit_nowait(
+            TelemetryEvent(
+                event_id=uuid.uuid4().hex,
+                context=context,
+                stage=Stage.ROUTER,
+                verdict=_OUTCOME_VERDICTS[outcome],
+                latency_ms=0.0,
+                prompt_hash=_digest(request.prompt),
+                timestamp_ns=time.time_ns(),
+                lane=TelemetryLane.DECISION,
+                error=(
+                    (error or failure_stage or "execution_error")
+                    if outcome == "error"
+                    else None
+                ),
+            )
+        )
         finalized_ns = time.perf_counter_ns()
         persisted, db_error = await persist_telemetry(runtime, collector.events)
         # Persistence latency is additive, not part of the defense decision
@@ -478,6 +506,9 @@ async def execute_defense(
         final_response = raw
         outcome = "partial" if final_route == Route.PARTIAL.value else "safe"
 
+    if outcome in ("safe", "partial"):
+        # Only text the caller actually receives joins the cross-turn tail.
+        runtime.cascade.commit_delivered(context, final_response)
     return await _finalize()
 
 

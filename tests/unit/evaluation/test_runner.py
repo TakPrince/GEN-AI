@@ -3,6 +3,7 @@ import sqlite3
 from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -305,6 +306,62 @@ def test_embedding_cache_round_trip(tmp_path: Path) -> None:
         connection.close()
 
 
+def test_documented_config_embeds_with_the_target_model() -> None:
+    # The pilot (20261029T015710-587cb28a) used llama3.2 for both generation and
+    # embeddings; keep the same model on both sides of every semantic comparison.
+    config = RunConfig(dataset_path=Path("cases.jsonl"), database_path=Path("r.db"))
+    assert config.target_model == config.embed_model == "llama3.2:latest"
+
+
+def test_cascade_builds_input_and_output_profiles_with_one_embedder() -> None:
+    from safety_platform.evaluation.cascade import build_cascade
+    from safety_platform.evaluation.llm import OllamaEmbedder
+    from safety_platform.guardrails.tier3.guard_classifier import GuardClassifier
+
+    class _Embedder:
+        def __init__(self) -> None:
+            self.seen: list[str] = []
+
+        def embed(self, text: str) -> tuple[float, ...]:
+            self.seen.append(text)
+            return (1.0, 0.0, 0.0, 0.0)
+
+    embedder = _Embedder()
+    runtime = build_cascade(
+        (case("a1", "attack", "train"), case("b1", "benign", "train")),
+        cast(OllamaEmbedder, embedder),
+        cast(GuardClassifier, object()),
+        output_train_cases=(case("o1", "attack", "train"),),
+    )
+
+    assert runtime.vector._embedder is embedder
+    assert runtime.vector_output is not None
+    assert runtime.vector_output._embedder is embedder
+    assert all(len(c.vector) == 4 for c in runtime.vector._centroids)
+    assert all(len(c.vector) == 4 for c in runtime.vector_output._centroids)
+    assert "prompt" in embedder.seen
+
+
+def test_input_prompts_labelled_unsafe_output_do_not_become_an_output_profile() -> None:
+    # Regression: dataset "unsafe_output" cases are attack *prompts*, not
+    # generated response text, so they must not seed output centroids.
+    from safety_platform.evaluation.cascade import build_cascade
+    from safety_platform.evaluation.llm import OllamaEmbedder
+    from safety_platform.guardrails.tier3.guard_classifier import GuardClassifier
+
+    class _Embedder:
+        def embed(self, text: str) -> tuple[float, ...]:
+            return (1.0, 0.0)
+
+    train = (
+        EvaluationCase("u1", "prompt", "attack", "unsafe_output", "b", "train", "src"),
+    )
+    runtime = build_cascade(
+        train, cast(OllamaEmbedder, _Embedder()), cast(GuardClassifier, object())
+    )
+    assert runtime.vector_output is None
+
+
 class _FakeClient:
     def __init__(self, model: str, *, timeout_s: float = 30.0) -> None:
         self.model = model
@@ -429,3 +486,54 @@ def test_completed_run_marks_run_and_stores_all_rows(
 
     assert row is not None and row[0] is not None
     assert rows is not None and rows[0] == 6
+
+
+class _InputErrorCascade:
+    """Input guard fails (route "error") for every case; records screening calls."""
+
+    def __init__(self) -> None:
+        self.directions: list[object] = []
+
+    async def run(
+        self,
+        text: str,
+        context: object,
+        *,
+        probe: object | None = None,
+    ) -> CascadeOutcome:
+        self.directions.append(getattr(context, "direction", None))
+        return CascadeOutcome("error", "error", "tier3", 2.0, True, 0.0)
+
+
+def test_input_guard_error_is_unscorable_and_skips_output_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from safety_platform.config.registry import Direction
+    from safety_platform.evaluation.report import load_report
+
+    cascade = _InputErrorCascade()
+    config = _configure_runner(
+        monkeypatch,
+        tmp_path,
+        build_cascade=lambda *args, **kwargs: cascade,
+    )
+    run_id = asyncio.run(run_evaluation(config))
+
+    # Output screening must not vet a response after the input guard failed.
+    assert Direction.OUTPUT not in cascade.directions
+    connection = sqlite3.connect(config.database_path)
+    try:
+        full = connection.execute(
+            "SELECT final_route, blocked FROM run_result "
+            "WHERE run_id = ? AND system = 'full'",
+            (run_id,),
+        ).fetchall()
+    finally:
+        connection.close()
+    assert full and all(row == ("error", 0) for row in full)
+
+    report = load_report(str(config.database_path), run_id=run_id)
+    full_metrics = next(item for item in report.systems if item.system == "full")
+    assert full_metrics.guard_errors == len(full)
+    assert report.valid_benchmark is False

@@ -66,3 +66,7 @@ docs/REMOTE_SSH.md
 docs/PHASE24_BASELINE.md
 docs/PHASE24_FALSE_NEGATIVE_ANALYSIS.md
 docs/PHASE24_IMPLEMENTATION_REPORT.md
+
+# Local evaluation datasets and generated results
+evaluation/data/
+evaluation/results/

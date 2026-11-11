@@ -21,6 +21,26 @@ def test_benchmark_router_config_is_the_single_source() -> None:
     assert model.threshold == 0.5
 
 
+def test_production_router_does_not_escalate_pass_band_without_regex() -> None:
+    # GEN-07 shadow result: a similarity or near-tie rule that catches
+    # development routing misses also escalates the benign cluster. The
+    # production router must keep bypassing that band until a policy meets
+    # the benign-call budget. Rho here is a heuristic score, not confidence.
+    router = ModelDrivenRouter(Tier3BypassRouter(benchmark_router()))
+    decision = router.route(
+        RouterFeatures(
+            regex_hit=False,
+            top_similarity=0.392,
+            top_gap=0.009,
+            tier2_ambiguous=False,
+            prompt_bytes=180,
+        )
+    )
+
+    assert decision.invoke_tier3 is False
+    assert decision.probability < 0.5
+
+
 def test_model_driven_router_exposes_wrapped_base_router() -> None:
     base = _distant_base()
 

@@ -14,6 +14,8 @@ from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from ..guardrails.json_parse import json_object as _json_object
+
 _EMBED_BATCH = 16
 _MAX_ATTEMPTS = 2
 _RETRY_BACKOFF_S = 0.2
@@ -431,20 +433,6 @@ def _embedding_value(value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise TypeError("cached embedding values must be numeric")
     return float(value)
-
-
-def _json_object(text: str) -> dict[str, object] | None:
-    start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end < start:
-        return None
-    try:
-        payload = json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    return payload
 
 
 __all__ = [

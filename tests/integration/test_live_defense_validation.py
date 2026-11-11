@@ -37,8 +37,11 @@ _OLLAMA_BASE = "http://127.0.0.1:11434"
 
 
 @pytest.mark.asyncio
-async def test_live_tier3_pass_reaches_real_target(tmp_path: Path) -> None:
+async def test_live_tier3_pass_reaches_real_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     assert os.environ.get("SAFETY_UI_SPECULATIVE_ECHO") == "0"
+    monkeypatch.setenv("SAFETY_UI_TIER3", "ollama")  # exercise the real classifier
     try:
         with urlopen(f"{_OLLAMA_BASE}/api/tags", timeout=3) as response:
             models = json.loads(response.read().decode("utf-8"))

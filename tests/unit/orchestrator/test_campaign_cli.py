@@ -143,6 +143,14 @@ async def test_fresh_run_announces_campaign_id_and_persists_to_out_dir(
     assert (out / f"redteam-singleturn-{run_id}.jsonl").exists()
     assert (out / f"redteam-singleturn-{run_id}-summary.json").exists()
 
+    store = CampaignStore(str(out / "orchestrator.sqlite3"))
+    try:
+        metadata = dict(store.campaign(run_id)["config"]["model_metadata"])
+    finally:
+        store.close()
+    # Real classifier mode vs demo heuristic must be recorded, never conflated.
+    assert metadata["tier3_mode"] == "demo heuristic"
+
 
 @pytest.mark.asyncio
 async def test_status_reports_interrupted_campaign_without_executing(

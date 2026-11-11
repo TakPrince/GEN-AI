@@ -116,3 +116,18 @@ async def test_background_consumer_writes_until_stopped(tmp_path: Path) -> None:
         row = connection.execute("SELECT event_id FROM stage_event").fetchone()
 
     assert row == ("3",)
+
+
+@pytest.mark.asyncio
+async def test_background_consumer_stops_with_empty_queue(tmp_path: Path) -> None:
+    sink = SqliteTelemetrySink(tmp_path / "events.sqlite3", max_batch_wait_ms=0)
+    bus = AsyncTelemetryBus()
+    stop = asyncio.Event()
+    task = sink.start(bus, stop=stop)
+    await asyncio.sleep(0)  # consume is now blocked waiting for an event
+    stop.set()
+
+    written = await asyncio.wait_for(task, timeout=1.0)
+
+    assert written == 0
+    assert bus.size == 0
