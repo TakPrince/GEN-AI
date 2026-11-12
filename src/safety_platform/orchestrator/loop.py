@@ -9,6 +9,7 @@ recorded separately and excluded from ASR denominators.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 import time
@@ -245,14 +246,14 @@ def _needs_judging(record: AttemptOutcome) -> bool:
     return record.execution_error is None and record.outcome != "error"
 
 
-def _judge_single(
+async def _judge_single(
     record: AttemptOutcome, mutation: Mutation, judge: _Judger
 ) -> AttemptOutcome:
     """Judging stage: a pure function of the received record, so it can resume."""
     if _needs_judging(record):
-        record = _judge_record(record, mutation, judge)
+        record = await _judge_record(record, mutation, judge)
     if record.blocked and record.raw_response is not None:
-        return _raw_judge_record(record, mutation, judge)
+        return await _raw_judge_record(record, mutation, judge)
     return record
 
 
@@ -278,17 +279,23 @@ async def _execute_single(
         seed=seed,
         model_metadata=model_metadata,
     )
-    return _judge_single(record, mutation, judge)
+    return await _judge_single(record, mutation, judge)
 
 
-def _judge_record(
+async def _judge_record(
     record: AttemptOutcome,
     mutation: Mutation,
     judge: _Judger,
 ) -> AttemptOutcome:
-    """Independent compliance evaluation of the user-visible response only."""
+    """Independent compliance evaluation of the user-visible response only.
+
+    The judge is a synchronous Ollama client (network call + admission wait);
+    it must run in a worker thread so the event loop stays responsive.
+    """
     try:
-        verdict = judge.judge(mutation.executed_prompt, record.final_response or "")
+        verdict = await asyncio.to_thread(
+            judge.judge, mutation.executed_prompt, record.final_response or ""
+        )
     except Exception as exc:  # judge infrastructure failure is a measurement gap
         return replace(record, judge_error=type(exc).__name__)
     complied = bool(verdict.complied) if verdict.error is None else None
@@ -300,7 +307,7 @@ def _judge_record(
     )
 
 
-def _raw_judge_record(
+async def _raw_judge_record(
     record: AttemptOutcome,
     mutation: Mutation,
     judge: _Judger,
@@ -308,7 +315,9 @@ def _raw_judge_record(
     """Diagnostic-only evaluation of the raw model output (never the ASR)."""
     assert record.raw_response is not None
     try:
-        verdict = judge.judge(mutation.executed_prompt, record.raw_response)
+        verdict = await asyncio.to_thread(
+            judge.judge, mutation.executed_prompt, record.raw_response
+        )
     except Exception as exc:
         return replace(record, raw_judge_error=type(exc).__name__)
     return replace(

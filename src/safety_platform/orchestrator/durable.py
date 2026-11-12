@@ -204,8 +204,14 @@ class _Heartbeat:
 class CampaignStore:
     def __init__(self, path: str, *, lease_s: float = _LEASE_S) -> None:
         # Autocommit connection; every multi-statement write uses _tx().
+        # check_same_thread=False: judging runs in a worker thread
+        # (asyncio.to_thread, P2-01) and the judge recorder persists verdicts
+        # from that thread. Access stays sequential — the owning coroutine is
+        # suspended while the worker runs — never concurrent.
         self._path = path
-        self._con = sqlite3.connect(path, timeout=30.0, isolation_level=None)
+        self._con = sqlite3.connect(
+            path, timeout=30.0, isolation_level=None, check_same_thread=False
+        )
         self._con.executescript(_SCHEMA)
         self._lease_ns = int(lease_s * 1_000_000_000)
         self.lost = threading.Event()  # set by the heartbeat on lease loss
@@ -867,7 +873,7 @@ async def _execute_single_units(
             stage="final",
             next_stage="raw",  # _judge_single judges the final, then the raw response
         )
-        record = _judge_single(record, mutation, recorder)
+        record = await _judge_single(record, mutation, recorder)
         store.complete_unit(
             run_id,
             unit["unit_id"],
