@@ -19,13 +19,20 @@ import os
 import random
 import threading
 import time
+from collections.abc import Callable
+from enum import Enum, auto
 from urllib.error import HTTPError, URLError
 
 __all__ = [
     "OllamaAdmission",
     "OllamaAdmissionTimeout",
+    "OllamaCircuitBreaker",
+    "OllamaCircuitOpen",
+    "OllamaCircuitState",
     "admission",
+    "breaker",
     "reset_admission_for_tests",
+    "reset_breaker_for_tests",
     "retry_after_s",
     "retryable",
     "sleep_backoff",
@@ -197,6 +204,138 @@ def reset_admission_for_tests(value: OllamaAdmission | None) -> None:
     global _admission
     with _admission_lock:
         _admission = value
+
+
+class OllamaCircuitOpen(RuntimeError):
+    """The Ollama circuit breaker is open: the server is considered down."""
+
+
+class OllamaCircuitState(Enum):
+    CLOSED = auto()
+    OPEN = auto()
+    HALF_OPEN = auto()
+
+
+class OllamaCircuitBreaker:
+    """Thread-safe circuit breaker shared by every Ollama HTTP client.
+
+    Counts only service failures (`retryable()` kinds: 429, 503,
+    connection errors). Permanent client errors (4xx), malformed responses
+    and admission queue timeouts are never counted. One call's retry
+    sequence counts as one outcome: the breaker is checked once before the
+    call and records the overall result after it, so it never interferes
+    with retry handling.
+    """
+
+    def __init__(
+        self,
+        *,
+        failure_threshold: int = 5,
+        recovery_timeout_s: float = 30.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if isinstance(failure_threshold, bool) or not isinstance(
+            failure_threshold, int
+        ):
+            raise ValueError("failure_threshold must be a positive integer")
+        if failure_threshold < 1:
+            raise ValueError("failure_threshold must be a positive integer")
+        if isinstance(recovery_timeout_s, bool) or recovery_timeout_s <= 0:
+            raise ValueError("recovery_timeout_s must be positive")
+        self._failure_threshold = failure_threshold
+        self._recovery_timeout_s = float(recovery_timeout_s)
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._state = OllamaCircuitState.CLOSED
+        self._consecutive_failures = 0
+        self._opened_at = 0.0
+        self._probe_claimed = False
+
+    @classmethod
+    def from_env(cls) -> OllamaCircuitBreaker:
+        threshold = _env_positive_int("SAFETY_OLLAMA_BREAKER_THRESHOLD", 5)
+        recovery = _env_positive_float("SAFETY_OLLAMA_BREAKER_RECOVERY_S", 30.0)
+        return cls(failure_threshold=threshold, recovery_timeout_s=recovery)
+
+    @property
+    def state(self) -> OllamaCircuitState:
+        with self._lock:
+            return self._state
+
+    @property
+    def failure_threshold(self) -> int:
+        return self._failure_threshold
+
+    @property
+    def recovery_timeout_s(self) -> float:
+        return self._recovery_timeout_s
+
+    def before_call(self) -> None:
+        """Gate one Ollama call; raises `OllamaCircuitOpen` while unavailable.
+
+        In HALF_OPEN exactly one caller is the recovery probe; concurrent
+        callers are rejected until that probe settles.
+        """
+        with self._lock:
+            if self._state is OllamaCircuitState.CLOSED:
+                return
+            if self._state is OllamaCircuitState.OPEN:
+                elapsed = self._clock() - self._opened_at
+                if elapsed < self._recovery_timeout_s:
+                    raise OllamaCircuitOpen("circuit_open")
+                # Recovery window elapsed: allow exactly one probe.
+                self._state = OllamaCircuitState.HALF_OPEN
+                self._probe_claimed = True
+                return
+            # HALF_OPEN: only the claimed probe proceeds.
+            if self._probe_claimed:
+                raise OllamaCircuitOpen("circuit_open")
+            self._probe_claimed = True
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._state = OllamaCircuitState.CLOSED
+            self._consecutive_failures = 0
+            self._probe_claimed = False
+
+    def record_failure(self, exc: BaseException) -> None:
+        """Record one call outcome. Non-service errors change nothing."""
+        if not retryable(exc):
+            return
+        with self._lock:
+            if self._state is OllamaCircuitState.HALF_OPEN:
+                # Failed probe: reopen with a fresh recovery window.
+                self._open_locked()
+                return
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._failure_threshold:
+                self._open_locked()
+
+    def _open_locked(self) -> None:
+        self._state = OllamaCircuitState.OPEN
+        self._opened_at = self._clock()
+        self._consecutive_failures = 0
+        self._probe_claimed = False
+
+
+_breaker: OllamaCircuitBreaker | None = None
+_breaker_lock = threading.Lock()
+
+
+def breaker() -> OllamaCircuitBreaker:
+    """Process-wide breaker, configured once from the environment on first use."""
+    global _breaker
+    if _breaker is None:
+        with _breaker_lock:
+            if _breaker is None:
+                _breaker = OllamaCircuitBreaker.from_env()
+    return _breaker
+
+
+def reset_breaker_for_tests(value: OllamaCircuitBreaker | None) -> None:
+    global _breaker
+    with _breaker_lock:
+        _breaker = value
 
 
 def _env_positive_int(name: str, default: int) -> int:

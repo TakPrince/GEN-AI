@@ -19,7 +19,9 @@ from ...config.registry import (
 )
 from ...ollama_runtime import (
     OllamaAdmissionTimeout,
+    OllamaCircuitOpen,
     admission,
+    breaker,
     retryable,
     sleep_backoff,
 )
@@ -185,6 +187,12 @@ class UrllibOllamaTransport:
         if not self._slots.acquire(timeout=self._queue_timeout_s):
             raise OllamaGuardError("capacity_exhausted")
         try:
+            # Fail fast while the server is considered down; never queue for
+            # admission behind a dead endpoint. One call = one breaker outcome.
+            try:
+                breaker().before_call()
+            except OllamaCircuitOpen as exc:
+                raise OllamaGuardError("circuit_open") from exc
             # Two admission layers: the private slot bounds Tier 3 calls to
             # this transport; the shared gate bounds every Ollama operation
             # in the process. Ordering is always private-slot -> shared gate
@@ -227,6 +235,7 @@ class UrllibOllamaTransport:
                 if attempt + 1 < _MAX_ATTEMPTS and retryable(exc):
                     sleep_backoff(attempt, exc=exc)
                     continue
+                breaker().record_failure(exc)
                 raise OllamaGuardError(type(exc).__name__) from exc
             break
         else:
@@ -240,6 +249,7 @@ class UrllibOllamaTransport:
         value = decoded.get("response")
         if not isinstance(value, str) or not value.strip():
             raise OllamaGuardError("malformed_response")
+        breaker().record_success()
         return value
 
 

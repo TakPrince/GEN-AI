@@ -15,7 +15,14 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from ..guardrails.json_parse import json_object as _json_object
-from ..ollama_runtime import OllamaAdmissionTimeout, admission, retryable, sleep_backoff
+from ..ollama_runtime import (
+    OllamaAdmissionTimeout,
+    OllamaCircuitOpen,
+    admission,
+    breaker,
+    retryable,
+    sleep_backoff,
+)
 
 _EMBED_BATCH = 16
 _MAX_ATTEMPTS = 2
@@ -126,6 +133,12 @@ class OllamaClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        # Fail fast while the server is considered down; never queue for
+        # admission behind a dead endpoint. One call = one breaker outcome.
+        try:
+            breaker().before_call()
+        except OllamaCircuitOpen as exc:
+            raise OllamaError("circuit_open") from exc
         gate = admission()
         for attempt in range(_MAX_ATTEMPTS):
             try:
@@ -147,11 +160,13 @@ class OllamaClient:
                     continue
                 if isinstance(exc, json.JSONDecodeError):
                     raise OllamaError("malformed_json") from exc
+                breaker().record_failure(exc)
                 raise OllamaError(type(exc).__name__) from exc
             finally:
                 gate.release()
             if not isinstance(decoded, dict):
                 raise OllamaError("malformed_response")
+            breaker().record_success()
             return decoded
         raise OllamaError("unreachable")
 
