@@ -37,7 +37,12 @@ from .guardrails.tier2.vector_filter import VectorFilter
 from .guardrails.tier3.guard_classifier import GuardClassifier
 from .middleware.regex_filter import RegexFilterMiddleware
 from .middleware.vector_filter import VectorFilterMiddleware
-from .research.ml_router import ModelDrivenRouter, RouterFeatures
+from .research.ml_router import (
+    EscalationDecision,
+    ModelDrivenRouter,
+    RouterFeatures,
+    escalation_for,
+)
 from .telemetry import AsyncTelemetryBus, TelemetryConsumer
 
 REFUSAL_TEXT = "I cannot help with that request."
@@ -399,10 +404,14 @@ async def execute_defense(
         )
     )
 
-    if decision.invoke_tier3 or second.verdict is SafetyVerdict.AMBIGUOUS:
-        # Multi-signal escalation: the router's escalation decision
-        # and Tier 2 ambiguity are independent signals — a Tier 2 PASS can no
-        # longer suppress an escalation the router selected.
+    if (
+        escalation_for(second.verdict, decision.invoke_tier3)
+        is EscalationDecision.ESCALATE
+    ):
+        # Multi-signal escalation policy (P2-03): Tier 3 runs only for
+        # uncertain results. A Tier 2 BLOCK is terminal (the router refuses
+        # regardless of any Tier 3 verdict) and a Tier 2 ERROR fails closed,
+        # so neither buys a Tier 3 call.
         started_tier3 = time.perf_counter_ns()
         third = await runtime.guard.classify_if_ambiguous(
             request.prompt,

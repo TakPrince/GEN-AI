@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from enum import Enum, auto
+
+from ..config.registry import SafetyVerdict
 
 
 def _finite(value: float, name: str) -> None:
@@ -209,6 +212,43 @@ class Tier3BypassRouter:
         return self._model
 
 
+class EscalationDecision(Enum):
+    """Explicit Tier 3 escalation outcome for one defended request.
+
+    Precedence (P2-03):
+    1. FAIL_CLOSED — Tier 2 infrastructure failure; router fails the request
+       closed, no Tier 3 call (a broken signal must not be "repaired").
+    2. CLEAR_BLOCK — an earlier tier already produced a terminal BLOCK; the
+       router refuses regardless of any Tier 3 verdict, so the multi-second
+       Tier 3 call is unnecessary.
+    3. ESCALATE — uncertain: router escalation or Tier 2 ambiguity. Ambiguity
+       never silently becomes an ALLOW.
+    4. CLEAR_ALLOW — both signals clear; skip Tier 3.
+    """
+
+    CLEAR_ALLOW = auto()
+    CLEAR_BLOCK = auto()
+    ESCALATE = auto()
+    FAIL_CLOSED = auto()
+
+
+def escalation_for(
+    tier2_verdict: SafetyVerdict, invoke_tier3: bool
+) -> EscalationDecision:
+    """Derive the escalation decision from the two available input signals.
+
+    No new thresholds: the router's learned threshold and drift floor, and
+    the Tier 2 ambiguity floor, remain the only knobs.
+    """
+    if tier2_verdict is SafetyVerdict.ERROR:
+        return EscalationDecision.FAIL_CLOSED
+    if tier2_verdict is SafetyVerdict.BLOCK:
+        return EscalationDecision.CLEAR_BLOCK
+    if invoke_tier3 or tier2_verdict is SafetyVerdict.AMBIGUOUS:
+        return EscalationDecision.ESCALATE
+    return EscalationDecision.CLEAR_ALLOW
+
+
 class ModelDrivenRouter:
     """Hazard-boundary drift guard over the statistical bypass router.
 
@@ -269,6 +309,7 @@ def benchmark_router() -> LogisticRegressionRouter:
 
 
 __all__ = [
+    "EscalationDecision",
     "LogisticRegressionRouter",
     "ModelDrivenRouter",
     "RouterDecision",
@@ -276,4 +317,5 @@ __all__ = [
     "RouterSample",
     "Tier3BypassRouter",
     "benchmark_router",
+    "escalation_for",
 ]
