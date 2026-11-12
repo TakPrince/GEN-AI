@@ -14,7 +14,7 @@ from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from ..ollama_runtime import retryable, sleep_backoff
+from ..ollama_runtime import OllamaAdmissionTimeout, admission, retryable, sleep_backoff
 from ..guardrails.json_parse import json_object as _json_object
 
 _EMBED_BATCH = 16
@@ -126,7 +126,12 @@ class OllamaClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        gate = admission()
         for attempt in range(_MAX_ATTEMPTS):
+            try:
+                gate.acquire()
+            except OllamaAdmissionTimeout as exc:
+                raise OllamaError("admission_timeout") from exc
             try:
                 with urlopen(request, timeout=self._timeout_s) as response:
                     decoded = json.loads(response.read().decode("utf-8"))
@@ -143,6 +148,8 @@ class OllamaClient:
                 if isinstance(exc, json.JSONDecodeError):
                     raise OllamaError("malformed_json") from exc
                 raise OllamaError(type(exc).__name__) from exc
+            finally:
+                gate.release()
             if not isinstance(decoded, dict):
                 raise OllamaError("malformed_response")
             return decoded

@@ -17,7 +17,7 @@ from ...config.registry import (
     SafetyVerdict,
     TierGates,
 )
-from ...ollama_runtime import retryable, sleep_backoff
+from ...ollama_runtime import OllamaAdmissionTimeout, admission, retryable, sleep_backoff
 from ..json_parse import json_object as _json_object
 from .classifier import ClassifierClient, Tier3Classifier, Tier3Result
 
@@ -180,7 +180,20 @@ class UrllibOllamaTransport:
         if not self._slots.acquire(timeout=self._queue_timeout_s):
             raise OllamaGuardError("capacity_exhausted")
         try:
-            return self._generate(request)
+            # Two admission layers: the private slot bounds Tier 3 calls to
+            # this transport; the shared gate bounds every Ollama operation
+            # in the process. Ordering is always private-slot -> shared gate
+            # and no path acquires them in reverse, so nesting cannot
+            # deadlock.
+            gate = admission()
+            try:
+                gate.acquire()
+            except OllamaAdmissionTimeout as exc:
+                raise OllamaGuardError("capacity_exhausted") from exc
+            try:
+                return self._generate(request)
+            finally:
+                gate.release()
         finally:
             self._slots.release()
 

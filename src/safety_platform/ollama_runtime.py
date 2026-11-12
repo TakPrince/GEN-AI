@@ -4,6 +4,13 @@ One policy module for both Ollama HTTP clients — `evaluation.llm.OllamaClient`
 (target, judge, embeddings, speculative echo) and
 `guardrails.tier3.guard_classifier.UrllibOllamaTransport` (Tier 3) — so the two
 cannot drift apart. Retry and admission rules live here once.
+
+Application-level admission (this module) protects this application's callers
+only. The Ollama server must additionally be configured to protect against
+other processes on the same host (do not set automatically; server flags):
+    OLLAMA_MAX_LOADED_MODELS=1
+    OLLAMA_NUM_PARALLEL=1
+    OLLAMA_MAX_QUEUE=8
 """
 
 from __future__ import annotations
@@ -105,6 +112,7 @@ class OllamaAdmission:
         if isinstance(queue_timeout_s, bool) or queue_timeout_s <= 0:
             raise ValueError("queue_timeout_s must be positive")
         self._slots = threading.BoundedSemaphore(max_concurrent)
+        self._max_concurrent = max_concurrent
         self._queue_timeout_s = float(queue_timeout_s)
         self._lock = threading.Lock()
         self._in_flight = 0
@@ -141,6 +149,14 @@ class OllamaAdmission:
     def max_in_flight(self) -> int:
         with self._lock:
             return self._max_in_flight
+
+    @property
+    def max_concurrent(self) -> int:
+        return self._max_concurrent
+
+    @property
+    def queue_timeout_s(self) -> float:
+        return self._queue_timeout_s
 
 
 class _AdmissionSlot:
