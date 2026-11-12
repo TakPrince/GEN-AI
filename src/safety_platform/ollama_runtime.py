@@ -162,7 +162,7 @@ class OllamaAdmission:
 class _AdmissionSlot:
     """Context manager holding one admission permit; never leaks on error."""
 
-    __slots__ = ("_admission", "_acquired")
+    __slots__ = ("_acquired", "_admission")
 
     def __init__(self, admission: OllamaAdmission) -> None:
         self._admission = admission

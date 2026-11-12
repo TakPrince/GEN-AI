@@ -14,8 +14,8 @@ from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from ..ollama_runtime import OllamaAdmissionTimeout, admission, retryable, sleep_backoff
 from ..guardrails.json_parse import json_object as _json_object
+from ..ollama_runtime import OllamaAdmissionTimeout, admission, retryable, sleep_backoff
 
 _EMBED_BATCH = 16
 _MAX_ATTEMPTS = 2

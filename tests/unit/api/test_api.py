@@ -127,6 +127,70 @@ def test_oversized_prompt_is_rejected(runtime, tmp_path) -> None:
     assert response.json() == {"error": {"code": "invalid_request"}}
 
 
+def test_prompt_at_limit_is_accepted(runtime, tmp_path) -> None:
+    completion = _Completion("OK")
+    with _client(runtime, completion, tmp_path / "api.sqlite3") as client:
+        response = _post(client, "a" * 16384)
+    assert response.status_code == 200
+
+
+def test_prompt_measured_in_bytes_not_characters(runtime, tmp_path) -> None:
+    # 8192 two-byte characters are exactly 16384 bytes: accepted.
+    with _client(runtime, _Completion(), tmp_path / "api.sqlite3") as client:
+        accepted = _post(client, "é" * 8192)
+        rejected = _post(client, "é" * 8193)
+    assert accepted.status_code == 200
+    assert rejected.status_code == 422
+
+
+def test_prompt_with_invalid_unicode_is_rejected(runtime, tmp_path) -> None:
+    # httpx cannot serialize lone surrogates, so send escaped JSON bytes
+    # directly; the server-side validator must reject the decoded value.
+    with _client(runtime, _Completion(), tmp_path / "api.sqlite3") as client:
+        response = client.post(
+            "/v1/chat",
+            content=b'{"prompt": "ok\\ud800later"}',
+            headers={"X-API-Key": "test-key", "Content-Type": "application/json"},
+        )
+    assert response.status_code == 422
+    assert response.json() == {"error": {"code": "invalid_request"}}
+
+
+def test_metadata_measured_in_bytes(runtime, tmp_path) -> None:
+    completion = _Completion("OK")
+    with _client(runtime, completion, tmp_path / "api.sqlite3") as client:
+        accepted = _post(client, "hello", metadata={"k" * 128: "v"})
+        rejected = _post(client, "hello", metadata={"k" * 129: "v"})
+    assert accepted.status_code == 200
+    assert rejected.status_code == 422
+
+
+def test_request_id_at_limit_is_accepted(runtime, tmp_path) -> None:
+    with _client(runtime, _Completion(), tmp_path / "api.sqlite3") as client:
+        accepted = _post(client, "hello", request_id="a" * 64)
+        rejected = _post(client, "hello", request_id="a" * 65)
+    assert accepted.status_code == 200
+    assert rejected.status_code == 422
+
+
+def test_body_at_limit_is_not_rejected_as_large(runtime, tmp_path) -> None:
+    with _client(runtime, _Completion(), tmp_path / "api.sqlite3") as client:
+        # Exactly at the transport bound: rejected as invalid JSON (422),
+        # not as too large (413).
+        at_limit = client.post(
+            "/v1/chat",
+            content=b"x" * 32768,
+            headers={"X-API-Key": "test-key"},
+        )
+        over_limit = client.post(
+            "/v1/chat",
+            content=b"x" * 32769,
+            headers={"X-API-Key": "test-key"},
+        )
+    assert at_limit.status_code == 422
+    assert over_limit.status_code == 413
+
+
 def test_oversized_body_is_rejected_before_validation(runtime, tmp_path) -> None:
     with _client(runtime, _Completion(), tmp_path / "api.sqlite3") as client:
         response = _post(client, "a" * 40000)

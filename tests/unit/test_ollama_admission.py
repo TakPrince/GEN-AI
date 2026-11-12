@@ -270,9 +270,7 @@ def test_failed_calls_release_permits(
     reset_admission_for_tests(shared)
     try:
         tracker = _OverlapTracker()
-        monkeypatch.setattr(
-            "safety_platform.evaluation.llm.urlopen", tracker.failing
-        )
+        monkeypatch.setattr("safety_platform.evaluation.llm.urlopen", tracker.failing)
         target = OllamaClient("model", timeout_s=1.0)
 
         with pytest.raises(OllamaError, match="OSError"):
@@ -280,9 +278,7 @@ def test_failed_calls_release_permits(
 
         assert shared.in_flight == 0
 
-        monkeypatch.setattr(
-            "safety_platform.evaluation.llm.urlopen", tracker.urlopen
-        )
+        monkeypatch.setattr("safety_platform.evaluation.llm.urlopen", tracker.urlopen)
         assert target.generate("prompt") == "ok"
     finally:
         reset_admission_for_tests(None)

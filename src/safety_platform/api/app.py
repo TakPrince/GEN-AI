@@ -24,18 +24,27 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from safety_platform.config.registry import ExecutionContext
+from safety_platform.config.registry import (
+    DEFAULT_PAYLOAD_LIMITS,
+    ExecutionContext,
+    utf8_byte_length,
+)
 from safety_platform.evaluation.llm import OllamaClient
 from safety_platform.execution import REFUSAL_TEXT, DefenseRequest, execute_defense
 
 logger = logging.getLogger("safety_platform.api")
 
-_MAX_PROMPT_BYTES = int(os.environ.get("SAFETY_API_MAX_PROMPT_BYTES", "16384"))
-_MAX_BODY_BYTES = int(os.environ.get("SAFETY_API_MAX_BODY_BYTES", "32768"))
-_MAX_METADATA = 16
-_MAX_METADATA_KEY = 128
-_MAX_METADATA_VALUE = 512
-_MAX_REQUEST_ID = 64
+_LIMITS = DEFAULT_PAYLOAD_LIMITS
+_MAX_PROMPT_BYTES = int(
+    os.environ.get("SAFETY_API_MAX_PROMPT_BYTES", _LIMITS.prompt_bytes)
+)
+_MAX_BODY_BYTES = int(
+    os.environ.get("SAFETY_API_MAX_BODY_BYTES", _LIMITS.request_body_bytes)
+)
+_MAX_METADATA = _LIMITS.metadata_entries
+_MAX_METADATA_KEY = _LIMITS.metadata_key_bytes
+_MAX_METADATA_VALUE = _LIMITS.metadata_value_bytes
+_MAX_REQUEST_ID = _LIMITS.request_id_chars
 
 
 class ApiError(Exception):
@@ -56,7 +65,11 @@ class ChatRequest(BaseModel):
     def _bounded_prompt(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("prompt must not be blank")
-        if len(value.encode("utf-8", "surrogatepass")) > _MAX_PROMPT_BYTES:
+        try:
+            length = utf8_byte_length(value)
+        except ValueError as exc:
+            raise ValueError("prompt contains invalid unicode") from exc
+        if length > _MAX_PROMPT_BYTES:
             raise ValueError("prompt exceeds the configured limit")
         return value
 
@@ -79,7 +92,12 @@ class ChatRequest(BaseModel):
         if len(value) > _MAX_METADATA:
             raise ValueError("too many metadata entries")
         for key, item in value.items():
-            if len(key) > _MAX_METADATA_KEY or len(item) > _MAX_METADATA_VALUE:
+            try:
+                key_bytes = utf8_byte_length(key)
+                item_bytes = utf8_byte_length(item)
+            except ValueError as exc:
+                raise ValueError("metadata contains invalid unicode") from exc
+            if key_bytes > _MAX_METADATA_KEY or item_bytes > _MAX_METADATA_VALUE:
                 raise ValueError("metadata entry is too large")
         return value
 

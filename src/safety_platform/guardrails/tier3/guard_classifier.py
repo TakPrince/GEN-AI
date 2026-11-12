@@ -17,7 +17,12 @@ from ...config.registry import (
     SafetyVerdict,
     TierGates,
 )
-from ...ollama_runtime import OllamaAdmissionTimeout, admission, retryable, sleep_backoff
+from ...ollama_runtime import (
+    OllamaAdmissionTimeout,
+    admission,
+    retryable,
+    sleep_backoff,
+)
 from ..json_parse import json_object as _json_object
 from .classifier import ClassifierClient, Tier3Classifier, Tier3Result
 

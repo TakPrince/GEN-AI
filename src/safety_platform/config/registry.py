@@ -150,6 +150,49 @@ class LatencyBudget:
 
 
 @dataclass(frozen=True, slots=True)
+class PayloadLimits:
+    """Centralized, immutable request payload bounds.
+
+    Values are UTF-8 encoded bytes (never Python character counts) except
+    `request_id_chars`, which follows the existing character contract.
+    Trust boundaries (HTTP API, dashboard entry) enforce these; internal
+    tiers keep their own conservative defaults (e.g. Tier 1 / Tier 3
+    standalone limit of 4096 bytes) as defense in depth.
+    """
+
+    prompt_bytes: int = 16384
+    request_body_bytes: int = 32768
+    metadata_entries: int = 16
+    metadata_key_bytes: int = 128
+    metadata_value_bytes: int = 512
+    request_id_chars: int = 64
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.prompt_bytes, "prompt_bytes"),
+            (self.request_body_bytes, "request_body_bytes"),
+            (self.metadata_entries, "metadata_entries"),
+            (self.metadata_key_bytes, "metadata_key_bytes"),
+            (self.metadata_value_bytes, "metadata_value_bytes"),
+            (self.request_id_chars, "request_id_chars"),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+
+
+DEFAULT_PAYLOAD_LIMITS = PayloadLimits()
+
+
+def utf8_byte_length(text: str) -> int:
+    """UTF-8 encoded byte length; invalid unicode (e.g. lone surrogates) is
+    rejected rather than silently counted with a lossy encoding."""
+    try:
+        return len(text.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ValueError("text contains invalid unicode") from exc
+
+
+@dataclass(frozen=True, slots=True)
 class DirectionProfile:
     thresholds: CascadeThresholds
     gates: TierGates
@@ -278,11 +321,13 @@ class TelemetryEvent:
 
 __all__ = [
     "DEFAULT_CASCADE_THRESHOLDS",
+    "DEFAULT_PAYLOAD_LIMITS",
     "CascadeThresholds",
     "Direction",
     "DirectionProfile",
     "ExecutionContext",
     "LatencyBudget",
+    "PayloadLimits",
     "Route",
     "RouteVerdict",
     "RoutingMargins",
@@ -292,4 +337,5 @@ __all__ = [
     "TelemetryEvent",
     "TelemetryLane",
     "TierGates",
+    "utf8_byte_length",
 ]

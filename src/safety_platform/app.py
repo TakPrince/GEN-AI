@@ -30,6 +30,7 @@ for _bootstrap in (str(_repo_root / "src"), str(_repo_root)):
 from metrics.db_adapter import default_database_path, load_metrics  # noqa: E402
 from safety_platform.config.registry import (  # noqa: E402
     DEFAULT_CASCADE_THRESHOLDS,
+    DEFAULT_PAYLOAD_LIMITS,
     ExecutionContext,
     RoutingMargins,
     TelemetryEvent,
@@ -244,7 +245,13 @@ def _tier3_guard(
     if mode != "ollama":
         raise ValueError("SAFETY_UI_TIER3 must be 'ollama' or 'heuristic'")
     connector = OllamaLlamaGuardConnector(
-        OllamaGuardConfig(model=_TIER3_MODEL, timeout_s=_TIER3_TIMEOUT_S),
+        OllamaGuardConfig(
+            model=_TIER3_MODEL,
+            timeout_s=_TIER3_TIMEOUT_S,
+            # Same prompt bound as the entry boundary: a 4-16 KiB prompt that
+            # passes Tier 1 must not fail closed at Tier 3 (prompt_too_large).
+            max_prompt_bytes=DEFAULT_PAYLOAD_LIMITS.prompt_bytes,
+        ),
         transport,
     )
     return GuardClassifier(connector, _THRESHOLDS, gates=MULTI_SIGNAL_GATES), (
@@ -287,7 +294,7 @@ def _speculative_echo_probe() -> SpeculativeEchoProbe | None:
 def _build_pipeline(database: str) -> _Pipeline:
     canary = _canary_detector()
     embedder = _HashingEmbedder()
-    regex = defense_regex_filter(max_input_bytes=16384)
+    regex = defense_regex_filter(max_input_bytes=DEFAULT_PAYLOAD_LIMITS.prompt_bytes)
     vector = VectorFilter(
         embedder,
         (
