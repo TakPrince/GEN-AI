@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-import time
 from dataclasses import dataclass
 from typing import Protocol
 from urllib.error import HTTPError, URLError
@@ -18,6 +17,7 @@ from ...config.registry import (
     SafetyVerdict,
     TierGates,
 )
+from ...ollama_runtime import retryable, sleep_backoff
 from ..json_parse import json_object as _json_object
 from .classifier import ClassifierClient, Tier3Classifier, Tier3Result
 
@@ -103,19 +103,10 @@ _ARBITRATION_SYSTEM = (
 _ARBITRATION_NUM_PREDICT = 128
 
 _MAX_ATTEMPTS = 2
-_RETRY_BACKOFF_S = 0.2
 
 
 class OllamaGuardError(RuntimeError):
     pass
-
-
-def _retryable(exc: BaseException) -> bool:
-    if isinstance(exc, HTTPError):
-        return False
-    if isinstance(exc, URLError):
-        return isinstance(exc.reason, ConnectionError)
-    return isinstance(exc, ConnectionError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,8 +206,8 @@ class UrllibOllamaTransport:
                 with urlopen(http_request, timeout=request.timeout_s) as response:
                     body = response.read().decode("utf-8")
             except (HTTPError, URLError, TimeoutError, OSError) as exc:
-                if attempt + 1 < _MAX_ATTEMPTS and _retryable(exc):
-                    time.sleep(_RETRY_BACKOFF_S)
+                if attempt + 1 < _MAX_ATTEMPTS and retryable(exc):
+                    sleep_backoff(attempt, exc=exc)
                     continue
                 raise OllamaGuardError(type(exc).__name__) from exc
             break
