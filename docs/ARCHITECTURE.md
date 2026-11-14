@@ -49,6 +49,25 @@ sequenceDiagram
 
 ## Three-Tier Cascade
 
+### Shared Runtime Construction (implemented: `src/safety_platform/runtime.py`)
+
+One module builds the demo runtime every interface consumes: hashing-embedder
+demo centroids, Tier 3 guard selection (`SAFETY_UI_TIER3=ollama|heuristic`),
+canary detector, speculative echo probe, and the `DefensePipeline` dataclass
+(runtime + per-turn telemetry wiring). `build_runtime(database)` is the single
+construction point.
+
+- Dashboard: `app._build_pipeline` delegates to `build_runtime` and adds
+  Streamlit UI labels on top; app.py owns no construction logic.
+- CLI: `python -m safety_platform check "prompt" | interactive` builds the same
+  pipeline and executes through `execute_defense`. Human or `--json` output;
+  exit codes 0 allowed / 1 blocked / 2 error; oversized interactive input is
+  refused at the CLI boundary with the Tier 1 payload limit.
+- Evaluation: `build_cascade` (evaluation/cascade.py) trains dataset centroids
+  but now makes the same escalation decisions (`escalation_for`) and always-on
+  output Tier 3 as the live path; its Tier 1 limit comes from
+  `DEFAULT_PAYLOAD_LIMITS`.
+
 ### Unified Defense Interface (implemented: `src/safety_platform/execution.py`)
 
 `execute_defense(runtime, defense_request, execution_context, *, completion)` is the
