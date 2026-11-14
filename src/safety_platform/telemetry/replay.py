@@ -126,17 +126,51 @@ def _replay_record(
     report.events_duplicated += len(events) - inserted
 
 
+def discover_dead_letter_files(path: str | Path) -> tuple[Path, ...]:
+    """Rotated siblings `<path>.<n>` ascending (chronological), then the active file.
+
+    Only numeric suffixes written by rotation are matched, so unrelated
+    sibling files are ignored. A missing active file yields an empty tuple.
+    """
+    base = Path(path)
+    prefix = f"{base.name}."
+    rotated: list[tuple[int, str]] = []
+    try:
+        entries = list(base.parent.iterdir())
+    except FileNotFoundError:
+        entries = []
+    for entry in entries:
+        if not entry.name.startswith(prefix):
+            continue
+        suffix = entry.name[len(prefix) :]
+        if entry.is_file() and suffix.isdigit() and int(suffix) > 0:
+            rotated.append((int(suffix), entry.name))
+    rotated.sort()
+    ordered = [base.parent / name for _, name in rotated]
+    if base.is_file():
+        ordered.append(base)
+    return tuple(ordered)
+
+
 def replay_dead_letter(
     sink: _ReplaySink,
     path: str | Path,
 ) -> ReplayReport:
-    """Replay one dead-letter JSONL file into the sink.
+    """Replay one dead-letter file family (active + rotated) into the sink.
 
-    Never clears the source file. Malformed or schema-invalid records are
+    Never clears the source files. Malformed or schema-invalid records are
     counted and reported; valid neighbouring records are still replayed.
+    `failure.line_no` is relative to the file that contained the record.
     """
 
     report = ReplayReport()
+    paths = discover_dead_letter_files(path) or (Path(path),)
+    for file_path in paths:
+        _replay_file(report, sink, file_path)
+    return report
+
+
+def _replay_file(report: ReplayReport, sink: _ReplaySink, path: Path) -> None:
     with open(path, encoding="utf-8") as handle:
         for line_no, line in enumerate(handle, start=1):
             if not line.strip():
@@ -158,7 +192,11 @@ def replay_dead_letter(
                         f"{exc}: {line.strip()[:200]}",
                     ),
                 )
-    return report
 
 
-__all__ = ["ReplayFailure", "ReplayReport", "replay_dead_letter"]
+__all__ = [
+    "ReplayFailure",
+    "ReplayReport",
+    "discover_dead_letter_files",
+    "replay_dead_letter",
+]

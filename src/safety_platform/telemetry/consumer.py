@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -11,8 +11,36 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .bus import AsyncTelemetryBus
-from .db_sink import TelemetryStore, _row
+from .dead_letter import write_dead_letter
+from .db_sink import TelemetryStore
 from .events import StageEvent
+
+# Dead-letter rotation defaults: bounded active file, bounded total retention.
+# Every limit is configurable; nothing is ever deleted to free space.
+DEFAULT_DEAD_LETTER_MAX_ACTIVE_BYTES = 8 * 1024 * 1024
+DEFAULT_DEAD_LETTER_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+
+# One writer at a time across every consumer sharing a dead-letter path:
+# append and rotation run inside this lock so records never interleave.
+_DEAD_LETTER_IO_LOCK = threading.Lock()
+
+# Dead-letter rotation defaults: bounded active file, bounded total retention.
+# Every limit is configurable; nothing is ever deleted to free space.
+DEFAULT_DEAD_LETTER_MAX_ACTIVE_BYTES = 8 * 1024 * 1024
+DEFAULT_DEAD_LETTER_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+
+# One writer at a time across every consumer sharing a dead-letter path:
+# append and rotation run inside this lock so records never interleave.
+_DEAD_LETTER_IO_LOCK = threading.Lock()
+
+# Dead-letter rotation defaults: bounded active file, bounded total retention.
+# Every limit is configurable; nothing is ever deleted to free space.
+DEFAULT_DEAD_LETTER_MAX_ACTIVE_BYTES = 8 * 1024 * 1024
+DEFAULT_DEAD_LETTER_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+
+# One writer at a time across every consumer sharing a dead-letter path:
+# append and rotation run inside this lock so records never interleave.
+_DEAD_LETTER_IO_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,11 +75,19 @@ class TelemetryConsumer:
         max_batch_wait_ms: int = 250,
         on_error: Callable[[str], None] | None = None,
         dead_letter_path: str | Path | None = None,
+        dead_letter_max_active_bytes: int = DEFAULT_DEAD_LETTER_MAX_ACTIVE_BYTES,
+        dead_letter_max_total_bytes: int = DEFAULT_DEAD_LETTER_MAX_TOTAL_BYTES,
     ) -> None:
         if not isinstance(batch_size, int) or batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
         if not isinstance(max_batch_wait_ms, int) or max_batch_wait_ms < 0:
             raise ValueError("max_batch_wait_ms must be a non-negative integer")
+        for name, value in (
+            ("dead_letter_max_active_bytes", dead_letter_max_active_bytes),
+            ("dead_letter_max_total_bytes", dead_letter_max_total_bytes),
+        ):
+            if not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
         self._bus = bus
         self._store = store
         self._batch_size = batch_size
@@ -60,6 +96,8 @@ class TelemetryConsumer:
         self._dead_letter_path = (
             Path(dead_letter_path) if dead_letter_path is not None else None
         )
+        self._dead_letter_max_active_bytes = dead_letter_max_active_bytes
+        self._dead_letter_max_total_bytes = dead_letter_max_total_bytes
         self._stop = asyncio.Event()
         self._task: asyncio.Task[int] | None = None
         self._executor = ThreadPoolExecutor(
@@ -227,33 +265,45 @@ class TelemetryConsumer:
                 break
         return tuple(events)
 
-    def _dead_letter(self, events: tuple[StageEvent, ...], error: str) -> bool:
-        """Append failed rows to a JSONL file; recoverable via INSERT OR IGNORE."""
-        if self._dead_letter_path is None:
-            self._stats = replace(
-                self._stats, events_lost=self._stats.events_lost + len(events)
-            )
-            return True
-        payload = {
-            "failed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "error": error,
-            "event_ids": [event.event_id for event in events],
-            # `rows` mirror the sink schema so replay is copy-paste-safe.
-            "rows": [_row(event) for event in events],
-        }
+    async def _dead_letter(self, events: tuple[StageEvent, ...], error: str) -> None:
+        """Persist failed rows to the dead-letter family off the event loop.
+
+        Blocking filesystem work runs in a worker thread; cancellation of the
+        awaiting coroutine never aborts the in‑flight write (the worker owns
+        the I/O lock until done). Storage-capacity refusal and filesystem
+        errors surface through `events_lost` / `last_error`, never as success.
+        """
+        assert self._dead_letter_path is not None
         try:
-            with open(self._dead_letter_path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
-        except OSError:
-            self._stats = replace(
-                self._stats, events_lost=self._stats.events_lost + len(events)
+            outcome = await asyncio.to_thread(
+                write_dead_letter,
+                self._dead_letter_path,
+                events,
+                error,
+                max_active_bytes=self._dead_letter_max_active_bytes,
+                max_total_bytes=self._dead_letter_max_total_bytes,
             )
-            return True
+        except OSError as exc:
+            self._stats = replace(
+                self._stats,
+                events_lost=self._stats.events_lost + len(events),
+                last_error=type(exc).__name__,
+            )
+            return
+        if outcome == "refused":
+            self._stats = replace(
+                self._stats,
+                events_lost=self._stats.events_lost + len(events),
+                last_error="dead_letter_full",
+            )
+            return
         self._stats = replace(
             self._stats,
             events_dead_lettered=self._stats.events_dead_lettered + len(events),
         )
-        return True
+
+    def _dead_letter_legacy(self, events, error) -> bool:  # pragma: no cover
+        raise NotImplementedError
 
 
 __all__ = ["ConsumerStats", "TelemetryConsumer"]
