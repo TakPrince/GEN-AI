@@ -27,15 +27,12 @@ for _bootstrap in (str(_repo_root / "src"), str(_repo_root)):
 from metrics.db_adapter import default_database_path, load_metrics  # noqa: E402
 from safety_platform.config.registry import (  # noqa: E402
     ExecutionContext,
-    TelemetryEvent,
 )
-from safety_platform.evaluation.cascade import CascadeRuntime  # noqa: E402
 from safety_platform.evaluation.dataset import EvaluationCase, load_cases  # noqa: E402
 from safety_platform.evaluation.llm import (  # noqa: E402
     ComplianceJudge,
     OllamaClient,
     OllamaError,
-    SpeculativeEchoProbe,
 )
 from safety_platform.execution import (  # noqa: E402
     DefenseRequest,
@@ -46,42 +43,22 @@ from safety_platform.execution import (  # noqa: E402
     vector_signal,
 )
 from safety_platform.execution import _digest as _digest_imported  # noqa: E402
-from safety_platform.guardrails.router import ResponseRouter  # noqa: E402
-from safety_platform.guardrails.tier1.regex_filter import (  # noqa: E402
-    RegexFilter,
-)
-from safety_platform.guardrails.tier2.vector_filter import (  # noqa: E402
-    VectorFilter,
-)
-from safety_platform.guardrails.tier3.guard_classifier import (  # noqa: E402
-    GuardClassifier,
-)
 from safety_platform.orchestrator.durable import (  # noqa: E402
     CampaignStore,
     describe_campaign,
     start_multi,
     start_single,
 )
-from safety_platform.research.ml_router import (  # noqa: E402
-    ModelDrivenRouter,
-)
-from safety_platform.runtime import (  # noqa: E402
+from safety_platform.runtime import (  # noqa: E402  # noqa: E402
     _COMPLETION_MODEL,
     _TIER3_TIMEOUT_S,
+    DefensePipeline,
     DemoHashingEmbedder,
-    build_demo_components,
+    build_runtime,
+    canary_detector,
+    speculative_echo_probe,
+    tier3_guard,
 )
-from safety_platform.runtime import (  # noqa: E402  test-facing aliases
-    canary_detector as _canary_detector,
-)
-from safety_platform.runtime import (  # noqa: E402
-    speculative_echo_probe as _speculative_echo_probe,
-)
-from safety_platform.runtime import (  # noqa: E402
-    tier3_guard as _tier3_guard,
-)
-from safety_platform.telemetry import AsyncTelemetryBus, TelemetryConsumer  # noqa: E402
-from safety_platform.telemetry.db_sink import SqliteTelemetrySink  # noqa: E402
 
 # Test-facing aliases (tests/unit/test_app.py uses app._persist and friends).
 _persist = persist_telemetry
@@ -90,7 +67,9 @@ _tier3_signal = tier3_signal
 _vector_signal = vector_signal
 _digest = _digest_imported
 _HashingEmbedder = DemoHashingEmbedder
-_tier3_guard = _tier3_guard  # test-facing alias
+_tier3_guard = tier3_guard  # test-facing alias
+_canary_detector = canary_detector  # test-facing alias
+_speculative_echo_probe = speculative_echo_probe  # test-facing alias
 _REFUSAL = "I cannot help with that request."
 # Re-exported for the Tier 3 lifecycle tests that construct guards via app.
 assert _TIER3_TIMEOUT_S > 0
@@ -158,64 +137,11 @@ class _Turn:
     ] = ()
 
 
-@dataclass(frozen=True, slots=True)
-class _Pipeline:
-    regex: RegexFilter
-    vector: VectorFilter
-    guard: GuardClassifier
-    ml_router: ModelDrivenRouter
-    router: ResponseRouter
-    sink: SqliteTelemetrySink
-    bus: AsyncTelemetryBus
-    consumer: TelemetryConsumer
-    cascade: CascadeRuntime
-    # Honest classifier-mode label surfaced in the UI ("ollama:<model>" or the
-    # explicitly labelled "demo heuristic"); never a heuristic dressed as a model.
-    tier3_mode: str
-    # Honest Tier 2 backend label (accepted Task 20 decision: the live backend
-    # stays the deterministic hashing trick — self-consistent lexical space,
-    # unlike the evaluation runner's semantic Ollama embeddings).
-    tier2_mode: str
-    echo_probe: SpeculativeEchoProbe | None = None
-
-
-class _Collector:
-    def __init__(self) -> None:
-        self.events: list[TelemetryEvent] = []
-
-    def emit_nowait(self, event: TelemetryEvent) -> bool:
-        self.events.append(event)
-        return True
+_Pipeline = DefensePipeline
 
 
 def _build_pipeline(database: str) -> _Pipeline:
-    canary = _canary_detector()
-    components = build_demo_components(canary)
-    sink = SqliteTelemetrySink(database)
-    # Per-turn drain (max_batch_wait_ms=0): Streamlit asyncio.run()s each turn on a
-    # fresh loop, so a long-lived consumer task cannot survive between reruns.
-    bus = AsyncTelemetryBus()
-    consumer = TelemetryConsumer(
-        bus,
-        sink,
-        max_batch_wait_ms=0,
-        # Retry once, then append failed rows to a recoverable dead-letter file.
-        dead_letter_path=f"{database}.dead-letter.jsonl",
-    )
-    return _Pipeline(
-        regex=components.regex,
-        vector=components.vector,
-        guard=components.guard,
-        ml_router=components.ml_router,
-        router=components.router,
-        sink=sink,
-        bus=bus,
-        consumer=consumer,
-        cascade=components.cascade,
-        echo_probe=_speculative_echo_probe(),
-        tier3_mode=components.tier3_mode,
-        tier2_mode=components.tier2_mode,
-    )
+    return build_runtime(database)
 
 
 def _cache_session_key() -> str:

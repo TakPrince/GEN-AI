@@ -38,6 +38,8 @@ from .guardrails.tier3.guard_classifier import (
     OllamaTransport,
 )
 from .research.ml_router import ModelDrivenRouter, Tier3BypassRouter, benchmark_router
+from .telemetry import AsyncTelemetryBus, TelemetryConsumer
+from .telemetry.db_sink import SqliteTelemetrySink
 
 _TOKEN = re.compile(r"[a-z0-9_'-]+")
 _THRESHOLDS = DEFAULT_CASCADE_THRESHOLDS
@@ -159,6 +161,58 @@ def speculative_echo_probe() -> SpeculativeEchoProbe | None:
     if os.environ.get("SAFETY_UI_SPECULATIVE_ECHO", "0") != "1":
         return None
     return OllamaSpeculativeEchoProbe(OllamaClient(_COMPLETION_MODEL))
+
+
+@dataclass(frozen=True)
+class DefensePipeline:
+    """A runtime plus its telemetry wiring; every interface executes through one."""
+
+    regex: RegexFilter
+    vector: VectorFilter
+    guard: GuardClassifier
+    ml_router: ModelDrivenRouter
+    router: ResponseRouter
+    sink: SqliteTelemetrySink
+    bus: AsyncTelemetryBus
+    consumer: TelemetryConsumer
+    cascade: CascadeRuntime
+    # Honest classifier-mode label surfaced in the UI ("ollama:<model>" or the
+    # explicitly labelled "demo heuristic"); never a heuristic dressed as a model.
+    tier3_mode: str
+    # Honest Tier 2 backend label (accepted Task 20 decision: the live backend
+    # stays the deterministic hashing trick — self-consistent lexical space,
+    # unlike the evaluation runner's semantic Ollama embeddings).
+    tier2_mode: str
+    echo_probe: SpeculativeEchoProbe | None = None
+
+
+def build_runtime(database: str) -> DefensePipeline:
+    """Demo runtime + per-turn telemetry assembly shared by dashboard and CLI."""
+    canary = canary_detector()
+    components = build_demo_components(canary)
+    sink = SqliteTelemetrySink(database)
+    bus = AsyncTelemetryBus()
+    consumer = TelemetryConsumer(
+        bus,
+        sink,
+        max_batch_wait_ms=0,
+        # Retry once, then append failed rows to a recoverable dead-letter file.
+        dead_letter_path=f"{database}.dead-letter.jsonl",
+    )
+    return DefensePipeline(
+        regex=components.regex,
+        vector=components.vector,
+        guard=components.guard,
+        ml_router=components.ml_router,
+        router=components.router,
+        sink=sink,
+        bus=bus,
+        consumer=consumer,
+        cascade=components.cascade,
+        echo_probe=speculative_echo_probe(),
+        tier3_mode=components.tier3_mode,
+        tier2_mode=components.tier2_mode,
+    )
 
 
 def build_demo_components(canary: CanaryDetector | None = None) -> DemoComponents:
