@@ -471,6 +471,13 @@ async def execute_defense(
         return await _finalize()
     raw_response = raw
     target_status = "executed"
+    if not raw.strip():
+        # Target anomaly (e.g. qwen3:8b occasionally emits nothing), not a
+        # security BLOCK: fail closed without claiming a guardrail decision.
+        error = "empty_response"
+        failure_stage = "target"
+        outcome = "error"
+        return await _finalize()
 
     output_context = _replace(
         context,

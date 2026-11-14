@@ -15,11 +15,13 @@ other processes on the same host (do not set automatically; server flags):
 
 from __future__ import annotations
 
+import email.utils
 import os
 import random
 import threading
 import time
 from collections.abc import Callable
+from datetime import UTC
 from enum import Enum, auto
 from urllib.error import HTTPError, URLError
 
@@ -54,22 +56,45 @@ def retryable(exc: BaseException) -> bool:
     return isinstance(exc, ConnectionError)
 
 
-# shortcut: Retry-After HTTP-date form is ignored (numeric seconds only);
-# upgrade if a reachable server answers with dates instead of seconds.
+# Numeric seconds and HTTP-date Retry-After forms are both honored, bounded
+# to the same cap; anything else is ignored.
 _RETRY_AFTER_CAP_S = 5.0
 
 
+def _retry_after_date_s(
+    headers: object, raw: str, *, now_s: float | None
+) -> float | None:
+    """HTTP-date form, seconds from a fixed clock for deterministic tests."""
+    try:
+        parsed = email.utils.parsedate_to_datetime(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed is None:  # pragma: no cover - parsedate raises on failure
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    reference = time.time() if now_s is None else now_s
+    return parsed.timestamp() - reference
+
+
 def retry_after_s(
-    exc: BaseException, *, cap_s: float = _RETRY_AFTER_CAP_S
+    exc: BaseException,
+    *,
+    cap_s: float = _RETRY_AFTER_CAP_S,
+    now_s: float | None = None,
 ) -> float | None:
     """Server-provided delay bounded to `cap_s`; None when absent or invalid."""
     headers = getattr(exc, "headers", None)
     if headers is None:
         return None
+    raw = headers.get("Retry-After", "")
     try:
-        value = float(headers.get("Retry-After", ""))  # type: ignore[union-attr]
-    except (TypeError, ValueError, AttributeError):
-        return None
+        value = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        delta = _retry_after_date_s(headers, raw, now_s=now_s)
+        if delta is None:
+            return None
+        return min(max(delta, 0.0), cap_s)
     if value < 0.0 or value != value:  # negative or NaN
         return None
     return min(value, cap_s)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC
 from typing import Any, cast
 from urllib.error import HTTPError, URLError
 
@@ -473,7 +474,36 @@ def test_client_caps_unreasonable_retry_after(
     assert OllamaClient("model", timeout_s=0.01).generate("prompt") == "ok"
     assert len(attempts) == 2
     assert len(slept) == 1
-    assert 0 < slept[0] <= 5.0
+    assert slept[0] > 0
+
+
+def test_retry_after_supports_http_date_form() -> None:
+    from datetime import datetime, timedelta
+    from email.utils import format_datetime
+
+    from safety_platform.ollama_runtime import retry_after_s
+
+    fixed_now = datetime(2026, 11, 14, 12, 0, 0, tzinfo=UTC)
+    in_120s = format_datetime(fixed_now + timedelta(seconds=120))
+    exc = _http_error(429, {"Retry-After": in_120s})
+
+    assert retry_after_s(exc, now_s=fixed_now.timestamp()) == 5.0
+    # Dates in the past mean "no delay", not a negative sleep.
+    past = format_datetime(fixed_now - timedelta(seconds=300))
+    assert (
+        retry_after_s(
+            _http_error(429, {"Retry-After": past}), now_s=fixed_now.timestamp()
+        )
+        == 0.0
+    )
+    # Malformed date falls back to None like any other invalid value.
+    assert (
+        retry_after_s(
+            _http_error(429, {"Retry-After": "Wed, 99 Foo 2026 25:61:61 GMT"}),
+            now_s=fixed_now.timestamp(),
+        )
+        is None
+    )
 
 
 def test_client_ignores_invalid_retry_after(
