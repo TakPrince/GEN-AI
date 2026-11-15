@@ -13,16 +13,15 @@ import threading
 from pathlib import Path
 
 import pytest
+from test_consumer_reliability import _ev, _FailingStore, _stopped
 
 from safety_platform.telemetry.bus import AsyncTelemetryBus
 from safety_platform.telemetry.consumer import TelemetryConsumer
 from safety_platform.telemetry.db_sink import SqliteTelemetrySink
-from safety_platform.telemetry.events import StageEvent
 from safety_platform.telemetry.replay import (
     discover_dead_letter_files,
     replay_dead_letter,
 )
-from test_consumer_reliability import _FailingStore, _ev, _stopped
 
 
 def _consumer(tmp_path: Path, store, **kwargs) -> TelemetryConsumer:
@@ -96,7 +95,9 @@ async def test_capacity_refusal_preserves_records_and_surfaces_loss(
     await _dead_letter_one_batch(consumer, "e0")
     active_before = (tmp_path / "dead.jsonl").read_text(encoding="utf-8")
 
-    full = _consumer(tmp_path, _FailingStore(), dead_letter_max_total_bytes=1)
+    full_store = _FailingStore()
+    full_store.fail = 99
+    full = _consumer(tmp_path, full_store, dead_letter_max_total_bytes=1)
     await _dead_letter_one_batch(full, "e1")
 
     assert full.stats.events_lost == 1
@@ -219,13 +220,12 @@ async def test_cancellation_during_dead_letter_write_keeps_file_integrity(
     def slow_writer(*args: object, **kwargs: object) -> str:
         started.set()
         release.wait(timeout=5)
-        return "written"
+        return real(*args, **kwargs)  # type: ignore[operator]
 
     import safety_platform.telemetry.consumer as consumer_module
 
     real = consumer_module._write_dead_letter
     consumer_module._write_dead_letter = slow_writer
-    task: asyncio.Task[int] | None = None
     try:
         consumer._bus.emit_nowait(_ev("e0"))
 
@@ -250,7 +250,9 @@ async def test_cancellation_during_dead_letter_write_keeps_file_integrity(
     payload = json.loads((tmp_path / "dead.jsonl").read_text(encoding="utf-8"))
     assert payload["event_ids"] == ["e0"]
     # A later run works: the lock was released by the worker, not the task.
-    consumer2 = _consumer(tmp_path, _FailingStore())
+    later_store = _FailingStore()
+    later_store.fail = 99
+    consumer2 = _consumer(tmp_path, later_store)
     await _dead_letter_one_batch(consumer2, "e1")
     lines = (tmp_path / "dead.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(lines) == 2

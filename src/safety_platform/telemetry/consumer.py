@@ -3,44 +3,19 @@
 from __future__ import annotations
 
 import asyncio
-import threading
-import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .bus import AsyncTelemetryBus
-from .dead_letter import write_dead_letter
 from .db_sink import TelemetryStore
+from .dead_letter import (
+    DEFAULT_DEAD_LETTER_MAX_ACTIVE_BYTES,
+    DEFAULT_DEAD_LETTER_MAX_TOTAL_BYTES,
+)
+from .dead_letter import write_dead_letter as _write_dead_letter
 from .events import StageEvent
-
-# Dead-letter rotation defaults: bounded active file, bounded total retention.
-# Every limit is configurable; nothing is ever deleted to free space.
-DEFAULT_DEAD_LETTER_MAX_ACTIVE_BYTES = 8 * 1024 * 1024
-DEFAULT_DEAD_LETTER_MAX_TOTAL_BYTES = 64 * 1024 * 1024
-
-# One writer at a time across every consumer sharing a dead-letter path:
-# append and rotation run inside this lock so records never interleave.
-_DEAD_LETTER_IO_LOCK = threading.Lock()
-
-# Dead-letter rotation defaults: bounded active file, bounded total retention.
-# Every limit is configurable; nothing is ever deleted to free space.
-DEFAULT_DEAD_LETTER_MAX_ACTIVE_BYTES = 8 * 1024 * 1024
-DEFAULT_DEAD_LETTER_MAX_TOTAL_BYTES = 64 * 1024 * 1024
-
-# One writer at a time across every consumer sharing a dead-letter path:
-# append and rotation run inside this lock so records never interleave.
-_DEAD_LETTER_IO_LOCK = threading.Lock()
-
-# Dead-letter rotation defaults: bounded active file, bounded total retention.
-# Every limit is configurable; nothing is ever deleted to free space.
-DEFAULT_DEAD_LETTER_MAX_ACTIVE_BYTES = 8 * 1024 * 1024
-DEFAULT_DEAD_LETTER_MAX_TOTAL_BYTES = 64 * 1024 * 1024
-
-# One writer at a time across every consumer sharing a dead-letter path:
-# append and rotation run inside this lock so records never interleave.
-_DEAD_LETTER_IO_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,7 +185,7 @@ class TelemetryConsumer:
                 )
                 if self._on_error is not None:
                     self._on_error(error)
-        self._dead_letter(batch, self._stats.last_error or "?")
+        await self._dead_letter(batch, self._stats.last_error or "?")
         return -1
 
     async def _next_batch(
@@ -269,14 +244,18 @@ class TelemetryConsumer:
         """Persist failed rows to the dead-letter family off the event loop.
 
         Blocking filesystem work runs in a worker thread; cancellation of the
-        awaiting coroutine never aborts the in‑flight write (the worker owns
+        awaiting coroutine never aborts the in-flight write (the worker owns
         the I/O lock until done). Storage-capacity refusal and filesystem
         errors surface through `events_lost` / `last_error`, never as success.
         """
-        assert self._dead_letter_path is not None
+        if self._dead_letter_path is None:
+            self._stats = replace(
+                self._stats, events_lost=self._stats.events_lost + len(events)
+            )
+            return
         try:
             outcome = await asyncio.to_thread(
-                write_dead_letter,
+                _write_dead_letter,
                 self._dead_letter_path,
                 events,
                 error,
@@ -301,9 +280,6 @@ class TelemetryConsumer:
             self._stats,
             events_dead_lettered=self._stats.events_dead_lettered + len(events),
         )
-
-    def _dead_letter_legacy(self, events, error) -> bool:  # pragma: no cover
-        raise NotImplementedError
 
 
 __all__ = ["ConsumerStats", "TelemetryConsumer"]

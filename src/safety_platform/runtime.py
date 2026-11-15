@@ -40,6 +40,10 @@ from .guardrails.tier3.guard_classifier import (
 from .research.ml_router import ModelDrivenRouter, Tier3BypassRouter, benchmark_router
 from .telemetry import AsyncTelemetryBus, TelemetryConsumer
 from .telemetry.db_sink import SqliteTelemetrySink
+from .telemetry.dead_letter import (
+    DEFAULT_DEAD_LETTER_MAX_ACTIVE_BYTES,
+    DEFAULT_DEAD_LETTER_MAX_TOTAL_BYTES,
+)
 
 _TOKEN = re.compile(r"[a-z0-9_'-]+")
 _THRESHOLDS = DEFAULT_CASCADE_THRESHOLDS
@@ -192,12 +196,27 @@ def build_runtime(database: str) -> DefensePipeline:
     components = build_demo_components(canary)
     sink = SqliteTelemetrySink(database)
     bus = AsyncTelemetryBus()
+
+    # Dead-letter bounds are operator-configurable; defaults keep total
+    # retention at 64 MiB with 8 MiB per active file (documented constants).
+    def _byte_env(name: str, default: int) -> int:
+        raw = os.environ.get(name, "").strip()
+        return int(raw) if raw.isdigit() else default
+
     consumer = TelemetryConsumer(
         bus,
         sink,
         max_batch_wait_ms=0,
         # Retry once, then append failed rows to a recoverable dead-letter file.
         dead_letter_path=f"{database}.dead-letter.jsonl",
+        dead_letter_max_active_bytes=_byte_env(
+            "SAFETY_UI_DEAD_LETTER_MAX_ACTIVE_BYTES",
+            DEFAULT_DEAD_LETTER_MAX_ACTIVE_BYTES,
+        ),
+        dead_letter_max_total_bytes=_byte_env(
+            "SAFETY_UI_DEAD_LETTER_MAX_TOTAL_BYTES",
+            DEFAULT_DEAD_LETTER_MAX_TOTAL_BYTES,
+        ),
     )
     return DefensePipeline(
         regex=components.regex,
