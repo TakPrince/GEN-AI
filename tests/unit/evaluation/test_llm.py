@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC
 from typing import Any, cast
 from urllib.error import HTTPError, URLError
 
@@ -368,11 +369,15 @@ def test_client_stops_after_two_attempts_with_typed_error(
     assert len(attempts) == 2
 
 
+def _http_error(code: int, headers: dict[str, str] | None = None) -> HTTPError:
+    return HTTPError("http://x", code, "error", cast(Any, headers or {}), None)
+
+
 def test_client_does_not_retry_permanent_http_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     urlopen, attempts = _flaky_urlopen(
-        (HTTPError("http://x", 503, "unavailable", cast(Any, {}), None),) * 3,
+        (_http_error(500),) * 3,
         (),
     )
     monkeypatch.setattr("safety_platform.evaluation.llm.urlopen", urlopen)
@@ -381,6 +386,145 @@ def test_client_does_not_retry_permanent_http_error(
         OllamaClient("model", timeout_s=0.01).generate("prompt")
 
     assert len(attempts) == 1
+
+
+def test_client_retries_429_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    urlopen, attempts = _flaky_urlopen(
+        (_http_error(429),),
+        (FlakyResponse(b'{"response": "ok"}'),),
+    )
+    monkeypatch.setattr("safety_platform.evaluation.llm.urlopen", urlopen)
+
+    assert OllamaClient("model", timeout_s=0.01).generate("prompt") == "ok"
+    assert len(attempts) == 2
+
+
+def test_client_retries_503_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    urlopen, attempts = _flaky_urlopen(
+        (_http_error(503),),
+        (FlakyResponse(b'{"response": "ok"}'),),
+    )
+    monkeypatch.setattr("safety_platform.evaluation.llm.urlopen", urlopen)
+
+    assert OllamaClient("model", timeout_s=0.01).generate("prompt") == "ok"
+    assert len(attempts) == 2
+
+
+def test_client_429_exhausts_two_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    urlopen, attempts = _flaky_urlopen(
+        (_http_error(429),) * 3,
+        (),
+    )
+    monkeypatch.setattr("safety_platform.evaluation.llm.urlopen", urlopen)
+
+    with pytest.raises(OllamaError, match="HTTPError"):
+        OllamaClient("model", timeout_s=0.01).generate("prompt")
+
+    assert len(attempts) == 2
+
+
+def test_client_does_not_retry_400(monkeypatch: pytest.MonkeyPatch) -> None:
+    urlopen, attempts = _flaky_urlopen(
+        (_http_error(400),) * 3,
+        (),
+    )
+    monkeypatch.setattr("safety_platform.evaluation.llm.urlopen", urlopen)
+
+    with pytest.raises(OllamaError, match="HTTPError"):
+        OllamaClient("model", timeout_s=0.01).generate("prompt")
+
+    assert len(attempts) == 1
+
+
+def test_client_respects_retry_after_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slept: list[float] = []
+
+    def fake_sleep(delay: float) -> None:
+        slept.append(delay)
+
+    monkeypatch.setattr("time.sleep", fake_sleep)
+    urlopen, attempts = _flaky_urlopen(
+        (_http_error(429, {"Retry-After": "2"}),),
+        (FlakyResponse(b'{"response": "ok"}'),),
+    )
+    monkeypatch.setattr("safety_platform.evaluation.llm.urlopen", urlopen)
+
+    assert OllamaClient("model", timeout_s=0.01).generate("prompt") == "ok"
+    assert len(attempts) == 2
+    assert slept == [2.0]
+
+
+def test_client_caps_unreasonable_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slept: list[float] = []
+
+    def fake_sleep(delay: float) -> None:
+        slept.append(delay)
+
+    monkeypatch.setattr("time.sleep", fake_sleep)
+    urlopen, attempts = _flaky_urlopen(
+        (_http_error(503, {"Retry-After": "3600"}),),
+        (FlakyResponse(b'{"response": "ok"}'),),
+    )
+    monkeypatch.setattr("safety_platform.evaluation.llm.urlopen", urlopen)
+
+    assert OllamaClient("model", timeout_s=0.01).generate("prompt") == "ok"
+    assert len(attempts) == 2
+    assert len(slept) == 1
+    assert slept[0] > 0
+
+
+def test_retry_after_supports_http_date_form() -> None:
+    from datetime import datetime, timedelta
+    from email.utils import format_datetime
+
+    from safety_platform.ollama_runtime import retry_after_s
+
+    fixed_now = datetime(2026, 11, 14, 12, 0, 0, tzinfo=UTC)
+    in_120s = format_datetime(fixed_now + timedelta(seconds=120))
+    exc = _http_error(429, {"Retry-After": in_120s})
+
+    assert retry_after_s(exc, now_s=fixed_now.timestamp()) == 5.0
+    # Dates in the past mean "no delay", not a negative sleep.
+    past = format_datetime(fixed_now - timedelta(seconds=300))
+    assert (
+        retry_after_s(
+            _http_error(429, {"Retry-After": past}), now_s=fixed_now.timestamp()
+        )
+        == 0.0
+    )
+    # Malformed date falls back to None like any other invalid value.
+    assert (
+        retry_after_s(
+            _http_error(429, {"Retry-After": "Wed, 99 Foo 2026 25:61:61 GMT"}),
+            now_s=fixed_now.timestamp(),
+        )
+        is None
+    )
+
+
+def test_client_ignores_invalid_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slept: list[float] = []
+
+    def fake_sleep(delay: float) -> None:
+        slept.append(delay)
+
+    monkeypatch.setattr("time.sleep", fake_sleep)
+    urlopen, attempts = _flaky_urlopen(
+        (_http_error(429, {"Retry-After": "not-a-number"}),),
+        (FlakyResponse(b'{"response": "ok"}'),),
+    )
+    monkeypatch.setattr("safety_platform.evaluation.llm.urlopen", urlopen)
+
+    assert OllamaClient("model", timeout_s=0.01).generate("prompt") == "ok"
+    assert len(attempts) == 2
+    assert len(slept) == 1
+    assert slept[0] > 0
 
 
 def test_client_does_not_retry_malformed_response(

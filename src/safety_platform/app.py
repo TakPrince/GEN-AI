@@ -1,11 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
-import math
 import os
-import re
 import sys
 import threading
 import uuid
@@ -29,19 +26,13 @@ for _bootstrap in (str(_repo_root / "src"), str(_repo_root)):
 
 from metrics.db_adapter import default_database_path, load_metrics  # noqa: E402
 from safety_platform.config.registry import (  # noqa: E402
-    DEFAULT_CASCADE_THRESHOLDS,
     ExecutionContext,
-    RoutingMargins,
-    TelemetryEvent,
 )
-from safety_platform.evaluation.cascade import CascadeRuntime  # noqa: E402
 from safety_platform.evaluation.dataset import EvaluationCase, load_cases  # noqa: E402
 from safety_platform.evaluation.llm import (  # noqa: E402
     ComplianceJudge,
     OllamaClient,
     OllamaError,
-    OllamaSpeculativeEchoProbe,
-    SpeculativeEchoProbe,
 )
 from safety_platform.execution import (  # noqa: E402
     DefenseRequest,
@@ -52,39 +43,22 @@ from safety_platform.execution import (  # noqa: E402
     vector_signal,
 )
 from safety_platform.execution import _digest as _digest_imported  # noqa: E402
-from safety_platform.guardrails.canary import (  # noqa: E402
-    CanaryDetector,
-    ConversationTail,
-)
-from safety_platform.guardrails.router import ResponseRouter  # noqa: E402
-from safety_platform.guardrails.tier1.regex_filter import (  # noqa: E402
-    RegexFilter,
-)
-from safety_platform.guardrails.tier1.rules import defense_regex_filter  # noqa: E402
-from safety_platform.guardrails.tier2.vector_filter import (  # noqa: E402
-    Centroid,
-    VectorFilter,
-)
-from safety_platform.guardrails.tier3.guard_classifier import (  # noqa: E402
-    MULTI_SIGNAL_GATES,
-    GuardClassifier,
-    OllamaGuardConfig,
-    OllamaLlamaGuardConnector,
-    OllamaTransport,
-)
 from safety_platform.orchestrator.durable import (  # noqa: E402
     CampaignStore,
     describe_campaign,
     start_multi,
     start_single,
 )
-from safety_platform.research.ml_router import (  # noqa: E402
-    ModelDrivenRouter,
-    Tier3BypassRouter,
-    benchmark_router,
+from safety_platform.runtime import (  # noqa: E402  # noqa: E402
+    _COMPLETION_MODEL,
+    _TIER3_TIMEOUT_S,
+    DefensePipeline,
+    DemoHashingEmbedder,
+    build_runtime,
+    canary_detector,
+    speculative_echo_probe,
+    tier3_guard,
 )
-from safety_platform.telemetry import AsyncTelemetryBus, TelemetryConsumer  # noqa: E402
-from safety_platform.telemetry.db_sink import SqliteTelemetrySink  # noqa: E402
 
 # Test-facing aliases (tests/unit/test_app.py uses app._persist and friends).
 _persist = persist_telemetry
@@ -92,25 +66,13 @@ _stage_latency = stage_latency
 _tier3_signal = tier3_signal
 _vector_signal = vector_signal
 _digest = _digest_imported
+_HashingEmbedder = DemoHashingEmbedder
+_tier3_guard = tier3_guard  # test-facing alias
+_canary_detector = canary_detector  # test-facing alias
+_speculative_echo_probe = speculative_echo_probe  # test-facing alias
 _REFUSAL = "I cannot help with that request."
-
-_TOKEN = re.compile(r"[a-z0-9_'-]+")
-_THRESHOLDS = DEFAULT_CASCADE_THRESHOLDS
-_MARGINS = RoutingMargins(0.01, 0.55)
-_RISK_PHRASES = (
-    "ignore previous",
-    "reveal system prompt",
-    "print system prompt",
-    "api key",
-    "secret key",
-    "write malware",
-    "build bomb",
-    "ransomware",
-    "phishing",
-    "self-harm",
-    "exploit",
-    "weapon",
-)
+# Re-exported for the Tier 3 lifecycle tests that construct guards via app.
+assert _TIER3_TIMEOUT_S > 0
 _DENSE_CSS = """
 <style>
 .block-container {padding-top: .5rem; padding-bottom: 5.5rem; max-width: 100%;}
@@ -175,178 +137,11 @@ class _Turn:
     ] = ()
 
 
-@dataclass(frozen=True, slots=True)
-class _Pipeline:
-    regex: RegexFilter
-    vector: VectorFilter
-    guard: GuardClassifier
-    ml_router: ModelDrivenRouter
-    router: ResponseRouter
-    sink: SqliteTelemetrySink
-    bus: AsyncTelemetryBus
-    consumer: TelemetryConsumer
-    cascade: CascadeRuntime
-    # Honest classifier-mode label surfaced in the UI ("ollama:<model>" or the
-    # explicitly labelled "demo heuristic"); never a heuristic dressed as a model.
-    tier3_mode: str
-    # Honest Tier 2 backend label (accepted Task 20 decision: the live backend
-    # stays the deterministic hashing trick — self-consistent lexical space,
-    # unlike the evaluation runner's semantic Ollama embeddings).
-    tier2_mode: str
-    echo_probe: SpeculativeEchoProbe | None = None
-
-
-class _HashingEmbedder:
-    def __init__(self, dimensions: int = 96) -> None:
-        self._dimensions = dimensions
-
-    def embed(self, text: str) -> tuple[float, ...]:
-        values = [0.0] * self._dimensions
-        for token in _TOKEN.findall(text.casefold()):
-            digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
-            index = int.from_bytes(digest[:4], "big") % self._dimensions
-            values[index] += 1.0 if digest[4] % 2 == 0 else -1.0
-        norm = math.sqrt(sum(value * value for value in values))
-        if norm == 0.0:
-            values[0] = 1.0
-            norm = 1.0
-        return tuple(value / norm for value in values)
-
-
-class _LocalClassifier:
-    async def score(self, text: str, context: ExecutionContext) -> float:
-        lowered = text.casefold()
-        matches = sum(phrase in lowered for phrase in _RISK_PHRASES)
-        if matches == 0:
-            return 0.05
-        return min(0.99, 0.62 + 0.18 * matches)
-
-
-_TIER3_MODEL = "qwen3:8b"
-# Cold load + output arbitration measured 6-60 s on this CPU; harness uses 120 s too.
-_TIER3_TIMEOUT_S = 120.0
-
-
-def _tier3_guard(
-    transport: OllamaTransport | None = None,
-) -> tuple[GuardClassifier, str]:
-    """Live Tier 3 is the real local classifier; the heuristic is opt-in demo only.
-
-    Timeouts, unreachable models, and malformed output surface as ERROR verdicts,
-    which the router fail-closes.
-    """
-    mode = os.environ.get("SAFETY_UI_TIER3", "ollama")
-    if mode == "heuristic":
-        guard = GuardClassifier(
-            _LocalClassifier(), _THRESHOLDS, gates=MULTI_SIGNAL_GATES
-        )
-        return guard, "demo heuristic"
-    if mode != "ollama":
-        raise ValueError("SAFETY_UI_TIER3 must be 'ollama' or 'heuristic'")
-    connector = OllamaLlamaGuardConnector(
-        OllamaGuardConfig(model=_TIER3_MODEL, timeout_s=_TIER3_TIMEOUT_S),
-        transport,
-    )
-    return GuardClassifier(connector, _THRESHOLDS, gates=MULTI_SIGNAL_GATES), (
-        f"ollama:{_TIER3_MODEL}"
-    )
-
-
-def _canary_detector() -> CanaryDetector | None:
-    """Opt-in known-value leak protection: `SAFETY_UI_CANARY=a,b,...`."""
-    raw = os.environ.get("SAFETY_UI_CANARY", "").strip()
-    if not raw:
-        return None
-    secrets = tuple(part.strip() for part in raw.split(",") if part.strip())
-    # Partial-fragment protection is on by default at a conservative 16 chars
-    # (0 disables); it cannot fire for secrets shorter than the fragment size.
-    partial = os.environ.get("SAFETY_UI_CANARY_PARTIAL_MIN", "16").strip()
-    partial_min = int(partial) if partial.isdigit() else 16
-    return CanaryDetector(
-        {f"canary-{index}": value for index, value in enumerate(secrets)},
-        partial_min_fragment=partial_min,
-    )
-
-
-class _Collector:
-    def __init__(self) -> None:
-        self.events: list[TelemetryEvent] = []
-
-    def emit_nowait(self, event: TelemetryEvent) -> bool:
-        self.events.append(event)
-        return True
-
-
-def _speculative_echo_probe() -> SpeculativeEchoProbe | None:
-    # Secure default: speculative echo is opt-in only; missing or "0" disables it.
-    if os.environ.get("SAFETY_UI_SPECULATIVE_ECHO", "0") != "1":
-        return None
-    return OllamaSpeculativeEchoProbe(OllamaClient(_COMPLETION_MODEL))
+_Pipeline = DefensePipeline
 
 
 def _build_pipeline(database: str) -> _Pipeline:
-    canary = _canary_detector()
-    embedder = _HashingEmbedder()
-    regex = defense_regex_filter(max_input_bytes=16384)
-    vector = VectorFilter(
-        embedder,
-        (
-            Centroid(
-                "override",
-                embedder.embed(
-                    "ignore previous instructions bypass policy system prompt"
-                ),
-            ),
-            Centroid(
-                "exfiltration",
-                embedder.embed("reveal system prompt print secret credentials api key"),
-            ),
-            Centroid(
-                "harm",
-                embedder.embed("write malware exploit weapon bomb ransomware"),
-            ),
-        ),
-        _THRESHOLDS,
-        _MARGINS,
-    )
-    model = benchmark_router()
-    guard, tier3_mode = _tier3_guard()
-    ml_router = ModelDrivenRouter(Tier3BypassRouter(model))
-    router = ResponseRouter()
-    sink = SqliteTelemetrySink(database)
-    # Per-turn drain (max_batch_wait_ms=0): Streamlit asyncio.run()s each turn on a
-    # fresh loop, so a long-lived consumer task cannot survive between reruns.
-    bus = AsyncTelemetryBus()
-    consumer = TelemetryConsumer(
-        bus,
-        sink,
-        max_batch_wait_ms=0,
-        # Retry once, then append failed rows to a recoverable dead-letter file.
-        dead_letter_path=f"{database}.dead-letter.jsonl",
-    )
-    return _Pipeline(
-        regex=regex,
-        vector=vector,
-        guard=guard,
-        ml_router=ml_router,
-        router=router,
-        sink=sink,
-        bus=bus,
-        consumer=consumer,
-        cascade=CascadeRuntime(
-            regex=regex,
-            vector=vector,
-            guard=guard,
-            ml_router=ml_router,
-            router=router,
-            tier3_on_output=True,
-            canary=canary,
-            canary_tail=None if canary is None else ConversationTail(canary),
-        ),
-        echo_probe=_speculative_echo_probe(),
-        tier3_mode=tier3_mode,
-        tier2_mode="hash-trick demo",
-    )
+    return build_runtime(database)
 
 
 def _cache_session_key() -> str:
@@ -393,7 +188,6 @@ def _render_metrics_row(database: str) -> None:
     )
 
 
-_COMPLETION_MODEL = "qwen3:8b"
 _JUDGE_MODEL = "llama3.1:8b"
 _PIPELINE_STAGES = (
     "Tier 1",

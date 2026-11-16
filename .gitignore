@@ -70,3 +70,4 @@ docs/PHASE24_IMPLEMENTATION_REPORT.md
 # Local evaluation datasets and generated results
 evaluation/data/
 evaluation/results/
+safety_cli.sqlite3

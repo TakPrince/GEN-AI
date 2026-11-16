@@ -7,7 +7,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
-from ...config.registry import CascadeThresholds, RoutingMargins, SafetyVerdict
+from ...config.registry import (
+    DEFAULT_PAYLOAD_LIMITS,
+    CascadeThresholds,
+    RoutingMargins,
+    SafetyVerdict,
+    utf8_byte_length,
+)
 
 
 class Embedder(Protocol):
@@ -81,10 +87,17 @@ class VectorFilter:
         centroids: Sequence[Centroid],
         thresholds: CascadeThresholds,
         margins: RoutingMargins,
+        *,
+        max_input_bytes: int = DEFAULT_PAYLOAD_LIMITS.prompt_bytes,
     ) -> None:
+        if isinstance(max_input_bytes, bool) or not isinstance(max_input_bytes, int):
+            raise ValueError("max_input_bytes must be a positive integer")
+        if max_input_bytes < 1:
+            raise ValueError("max_input_bytes must be a positive integer")
         self._embedder = embedder
         self._thresholds = thresholds
         self._margins = margins
+        self._max_input_bytes = max_input_bytes
         self._dimension: int | None = None
         normalized: list[Centroid] = []
         for centroid in centroids:
@@ -100,6 +113,12 @@ class VectorFilter:
     def evaluate(self, text: str) -> VectorFilterResult:
         if not isinstance(text, str):
             raise TypeError("text must be a string")
+        try:
+            input_bytes = utf8_byte_length(text)
+        except ValueError:
+            return VectorFilterResult(SafetyVerdict.ERROR, error="invalid_unicode")
+        if input_bytes > self._max_input_bytes:
+            return VectorFilterResult(SafetyVerdict.ERROR, error="input_too_large")
         if not self._centroids or self._dimension is None:
             return VectorFilterResult(SafetyVerdict.PASS)
 

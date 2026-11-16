@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 from ..config.registry import (
     DEFAULT_CASCADE_THRESHOLDS,
+    DEFAULT_PAYLOAD_LIMITS,
     CascadeThresholds,
     Direction,
     ExecutionContext,
@@ -23,10 +24,12 @@ from ..guardrails.tier1.rules import defense_regex_filter
 from ..guardrails.tier2.vector_filter import Centroid, VectorFilter
 from ..guardrails.tier3.guard_classifier import GuardClassifier
 from ..research.ml_router import (
+    EscalationDecision,
     ModelDrivenRouter,
     RouterFeatures,
     Tier3BypassRouter,
     benchmark_router,
+    escalation_for,
 )
 from .dataset import EvaluationCase
 from .llm import (
@@ -170,13 +173,13 @@ class CascadeRuntime:
             )
         )
         always_check = self.tier3_on_output and context.direction is Direction.OUTPUT
-        if (
-            decision.invoke_tier3
-            or second.verdict is SafetyVerdict.AMBIGUOUS
-            or always_check
-        ):
-            # Multi-signal escalation: independent signals, not a
-            # single Tier-2 ambiguity gate.
+        escalation = escalation_for(second.verdict, decision.invoke_tier3)
+        if escalation is EscalationDecision.ESCALATE or always_check:
+            # One escalation policy for every interface (P2-04): Tier 3 runs
+            # only for uncertain results. A Tier 2 BLOCK is terminal (the
+            # router refuses regardless of any Tier 3 verdict) and a Tier 2
+            # ERROR fails closed, so neither buys a Tier 3 call. Output
+            # direction adds the always-on check when configured.
             third = await self.guard.classify_if_ambiguous(
                 text,
                 context,
@@ -248,7 +251,7 @@ def build_cascade(
                 ),
                 active_margins,
             )
-    regex = defense_regex_filter(max_input_bytes=16384)
+    regex = defense_regex_filter(max_input_bytes=DEFAULT_PAYLOAD_LIMITS.prompt_bytes)
     router_model = benchmark_router()
     return CascadeRuntime(
         regex=regex,
@@ -257,6 +260,10 @@ def build_cascade(
         ml_router=ModelDrivenRouter(Tier3BypassRouter(router_model)),
         router=ResponseRouter(),
         vector_output=profile,
+        # Output parity with the live path (dashboard/runtime): the response
+        # is always Tier-3-checked. No labeled response corpus exists to
+        # train output centroids, so this is the output safety net.
+        tier3_on_output=True,
     )
 
 

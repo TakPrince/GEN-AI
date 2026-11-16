@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-import time
 from dataclasses import dataclass
 from typing import Protocol
 from urllib.error import HTTPError, URLError
@@ -17,6 +16,14 @@ from ...config.registry import (
     ExecutionContext,
     SafetyVerdict,
     TierGates,
+)
+from ...ollama_runtime import (
+    OllamaAdmissionTimeout,
+    OllamaCircuitOpen,
+    admission,
+    breaker,
+    retryable,
+    sleep_backoff,
 )
 from ..json_parse import json_object as _json_object
 from .classifier import ClassifierClient, Tier3Classifier, Tier3Result
@@ -103,19 +110,10 @@ _ARBITRATION_SYSTEM = (
 _ARBITRATION_NUM_PREDICT = 128
 
 _MAX_ATTEMPTS = 2
-_RETRY_BACKOFF_S = 0.2
 
 
 class OllamaGuardError(RuntimeError):
     pass
-
-
-def _retryable(exc: BaseException) -> bool:
-    if isinstance(exc, HTTPError):
-        return False
-    if isinstance(exc, URLError):
-        return isinstance(exc.reason, ConnectionError)
-    return isinstance(exc, ConnectionError)
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,7 +187,26 @@ class UrllibOllamaTransport:
         if not self._slots.acquire(timeout=self._queue_timeout_s):
             raise OllamaGuardError("capacity_exhausted")
         try:
-            return self._generate(request)
+            # Fail fast while the server is considered down; never queue for
+            # admission behind a dead endpoint. One call = one breaker outcome.
+            try:
+                breaker().before_call()
+            except OllamaCircuitOpen as exc:
+                raise OllamaGuardError("circuit_open") from exc
+            # Two admission layers: the private slot bounds Tier 3 calls to
+            # this transport; the shared gate bounds every Ollama operation
+            # in the process. Ordering is always private-slot -> shared gate
+            # and no path acquires them in reverse, so nesting cannot
+            # deadlock.
+            gate = admission()
+            try:
+                gate.acquire()
+            except OllamaAdmissionTimeout as exc:
+                raise OllamaGuardError("capacity_exhausted") from exc
+            try:
+                return self._generate(request)
+            finally:
+                gate.release()
         finally:
             self._slots.release()
 
@@ -215,9 +232,10 @@ class UrllibOllamaTransport:
                 with urlopen(http_request, timeout=request.timeout_s) as response:
                     body = response.read().decode("utf-8")
             except (HTTPError, URLError, TimeoutError, OSError) as exc:
-                if attempt + 1 < _MAX_ATTEMPTS and _retryable(exc):
-                    time.sleep(_RETRY_BACKOFF_S)
+                if attempt + 1 < _MAX_ATTEMPTS and retryable(exc):
+                    sleep_backoff(attempt, exc=exc)
                     continue
+                breaker().record_failure(exc)
                 raise OllamaGuardError(type(exc).__name__) from exc
             break
         else:
@@ -231,6 +249,7 @@ class UrllibOllamaTransport:
         value = decoded.get("response")
         if not isinstance(value, str) or not value.strip():
             raise OllamaGuardError("malformed_response")
+        breaker().record_success()
         return value
 
 

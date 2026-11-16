@@ -631,6 +631,28 @@ async def test_target_failure_records_attempted_target_input(
     assert boom.calls == ["hello there"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", ["", "  \n\t  "])
+async def test_empty_target_output_is_target_error_never_allow(
+    runtime, monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    # P2.5/R-06 regression: qwen3:8b occasionally returns an empty string;
+    # that must not route as a successful ALLOW.
+    monkeypatch.setenv("SAFETY_UI_SPECULATIVE_ECHO", "0")
+    from safety_platform.execution import REFUSAL_TEXT
+
+    result = await _run(runtime, "what is a pickle?", lambda _prompt: raw)
+
+    assert result.outcome == "error"
+    assert result.blocked is False  # target anomaly, not a security BLOCK
+    assert result.error == "empty_response"
+    assert result.failure_stage == "target"
+    assert result.target_status == "executed"
+    assert result.final_route == "error"
+    assert result.final_response == REFUSAL_TEXT
+    assert result.telemetry_persisted is True
+
+
 # --- Tier 3 live wiring: real connector, fail-closed, labelled heuristic ----
 
 

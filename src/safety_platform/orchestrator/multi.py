@@ -11,6 +11,7 @@ a blocked turn never triggers any direct target call to continue.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 import time
@@ -196,7 +197,7 @@ async def run_conversation(
                 on_response(state, response)  # persisted before judging
         else:
             response, pending = pending, None
-        record = _judge_turn(response, judge)
+        record = await _judge_turn(response, judge)
         state = state.add_turn(record)
         if not _is_executed(record):
             state = state.fail(
@@ -222,7 +223,7 @@ async def run_conversation(
         checkpoint(state)
     if state.status == "running":
         state = state.complete("max_turns")
-    outcome = _conversation_judge(
+    outcome = await _conversation_judge(
         state, judge, timestamp, escalation, max_turns, model_metadata, total_latency
     )
     return outcome
@@ -293,12 +294,18 @@ def _is_executed(record: TurnRecord) -> bool:
     return record.execution_error is None and record.outcome != "error"
 
 
-def _judge_turn(record: TurnRecord, judge: _Judger) -> TurnRecord:
-    """Judging stage: a pure function of the received response, so it can resume."""
+async def _judge_turn(record: TurnRecord, judge: _Judger) -> TurnRecord:
+    """Judging stage: a pure function of the received response, so it can resume.
+
+    The judge is a synchronous Ollama client (network call + admission wait);
+    it must run in a worker thread so the event loop stays responsive.
+    """
     if not _is_executed(record):
         return record
     try:
-        verdict = judge.judge(record.prompt, record.final_response or "")
+        verdict = await asyncio.to_thread(
+            judge.judge, record.prompt, record.final_response or ""
+        )
     except Exception as exc:
         return replace(record, judge_error=type(exc).__name__)
     return replace(
@@ -308,7 +315,7 @@ def _judge_turn(record: TurnRecord, judge: _Judger) -> TurnRecord:
     )
 
 
-def _conversation_judge(
+async def _conversation_judge(
     state: AttackState,
     judge: _Judger,
     timestamp: str,
@@ -325,7 +332,9 @@ def _conversation_judge(
             f"USER: {user}\nASSISTANT: {reply}" for user, reply in state.history()
         )
         try:
-            structured = judge.judge_conversation(state.objective, transcript)
+            structured = await asyncio.to_thread(
+                judge.judge_conversation, state.objective, transcript
+            )
         except Exception as exc:
             verdict = ComplianceVerdict.JUDGE_ERROR.value
             error = type(exc).__name__
