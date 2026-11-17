@@ -122,7 +122,7 @@ class TelemetryConsumer:
         finally:
             self._task = None
             self._closed = True
-            self._executor.shutdown(wait=True)
+            self._executor.shutdown(wait=False, cancel_futures=True)
         return written
 
     async def run(self, *, stop: asyncio.Event | None = None) -> int:
