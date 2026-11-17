@@ -621,6 +621,23 @@ async def test_connector_output_direction_marks_refusal_safe() -> None:
 
 
 @pytest.mark.asyncio
+async def test_output_direction_sets_stop_sequence_only() -> None:
+    transport = StubTransport('{"violation": false, ')
+    connector = OllamaLlamaGuardConnector(OllamaGuardConfig(), transport)
+
+    assert await connector.score("response", output_context()) == 0.0
+    assert transport.request is not None
+    assert transport.request.stop == ('"reason"',)
+
+    input_transport = StubTransport("safe")
+    input_connector = OllamaLlamaGuardConnector(OllamaGuardConfig(), input_transport)
+
+    assert await input_connector.score("prompt", context()) == 0.0
+    assert input_transport.request is not None
+    assert input_transport.request.stop is None
+
+
+@pytest.mark.asyncio
 async def test_connector_output_direction_fails_closed_on_malformed_verdict() -> None:
     connector = OllamaLlamaGuardConnector(
         OllamaGuardConfig(),
@@ -711,6 +728,7 @@ async def test_transport_sends_system_and_num_predict(
             timeout_s=1.0,
             system="system prompt",
             num_predict=128,
+            stop=('"reason"',),
         )
     )
 
@@ -721,6 +739,7 @@ async def test_transport_sends_system_and_num_predict(
     assert payload["system"] == "system prompt"
     assert payload["options"]["num_predict"] == 128
     assert payload["options"]["temperature"] == 0
+    assert payload["options"]["stop"] == ['"reason"']
 
 
 @pytest.mark.asyncio

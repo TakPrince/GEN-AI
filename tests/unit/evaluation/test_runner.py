@@ -303,6 +303,18 @@ def test_reuse_baseline_rejects_unknown_run() -> None:
         connection.close()
 
 
+def test_tier3_digest_changes_when_stop_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    baseline = runner_module._tier3_digest()
+    assert baseline != runner_module._tier3_digest(stop=())
+    assert runner_module._tier3_digest(
+        stop=('"reason"',)
+    ) != runner_module._tier3_digest(stop=("</s>",))
+    monkeypatch.setattr(runner_module, "_OUTPUT_STOP", ("</s>",))
+    assert runner_module._tier3_digest() != baseline
+
+
 def test_reuse_baseline_rejects_changed_judge_digest() -> None:
     connection = _reuse_database(
         config_json=json.dumps(
@@ -328,7 +340,7 @@ def test_reuse_baseline_rejects_changed_judge_digest() -> None:
         connection.close()
 
 
-def test_reuse_baseline_rejects_changed_tier3_digest() -> None:
+def test_reuse_baseline_ignores_changed_tier3_digest() -> None:
     connection = _reuse_database(
         config_json=json.dumps(
             {
@@ -338,25 +350,25 @@ def test_reuse_baseline_rejects_changed_tier3_digest() -> None:
         )
     )
     try:
-        with pytest.raises(ValueError, match="tier3.*digest"):
-            _load_reusable_baseline(
-                connection,
-                run_id="old-run",
-                test_cases=(case("a1", "attack"),),
-                target_model="target",
-                judge_model="judge",
-                digest="digest",
-                judge_digest=runner_module._judge_digest(),
-                tier3_digest=runner_module._tier3_digest(),
-            )
+        reused = _load_reusable_baseline(
+            connection,
+            run_id="old-run",
+            test_cases=(case("a1", "attack"),),
+            target_model="target",
+            judge_model="judge",
+            digest="digest",
+            judge_digest=runner_module._judge_digest(),
+            tier3_digest=runner_module._tier3_digest(),
+        )
     finally:
         connection.close()
+    assert set(reused) == {"a1"}
 
 
 def test_reuse_baseline_rejects_missing_digest_without_force() -> None:
     connection = _reuse_database(config_json="{}")
     try:
-        with pytest.raises(ValueError, match="no judge/tier3 prompt digest"):
+        with pytest.raises(ValueError, match="no judge prompt digest"):
             _load_reusable_baseline(
                 connection,
                 run_id="old-run",

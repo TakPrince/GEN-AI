@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import threading
 from dataclasses import dataclass
 from typing import Protocol
@@ -108,6 +109,8 @@ _ARBITRATION_SYSTEM = (
 )
 
 _ARBITRATION_NUM_PREDICT = 128
+_OUTPUT_STOP = ('"reason"',)
+_TRUNCATED_VIOLATION = re.compile(r'^\s*\{\s*"violation"\s*:\s*(true|false)\b')
 
 _MAX_ATTEMPTS = 2
 
@@ -150,6 +153,7 @@ class OllamaGenerateRequest:
     timeout_s: float
     system: str | None = None
     num_predict: int = 8
+    stop: tuple[str, ...] | None = None
 
 
 class OllamaTransport(Protocol):
@@ -211,12 +215,18 @@ class UrllibOllamaTransport:
             self._slots.release()
 
     def _generate(self, request: OllamaGenerateRequest) -> str:
+        options: dict[str, object] = {
+            "temperature": 0,
+            "num_predict": request.num_predict,
+        }
+        if request.stop is not None:
+            options["stop"] = list(request.stop)
         payload: dict[str, object] = {
             "model": request.model,
             "prompt": request.prompt,
             "stream": False,
             "think": False,
-            "options": {"temperature": 0, "num_predict": request.num_predict},
+            "options": options,
         }
         if request.system is not None:
             payload["system"] = request.system
@@ -293,6 +303,7 @@ class OllamaLlamaGuardConnector:
                     system=_ARBITRATION_SYSTEM,
                     timeout_s=self._config.timeout_s,
                     num_predict=_ARBITRATION_NUM_PREDICT,
+                    stop=_OUTPUT_STOP,
                 )
             )
             return _violation_confidence(output)
@@ -353,12 +364,15 @@ def _score_output(output: str) -> float:
 
 def _violation_confidence(output: str) -> float:
     payload = _json_object(output)
-    if payload is None:
+    if payload is not None:
+        violation = payload.get("violation")
+        if isinstance(violation, bool):
+            return 1.0 if violation else 0.0
         raise OllamaGuardError("malformed_verdict")
-    violation = payload.get("violation")
-    if isinstance(violation, bool):
-        return 1.0 if violation else 0.0
-    raise OllamaGuardError("malformed_verdict")
+    match = _TRUNCATED_VIOLATION.search(output)
+    if match is None:
+        raise OllamaGuardError("malformed_verdict")
+    return 1.0 if match.group(1) == "true" else 0.0
 
 
 __all__ = [

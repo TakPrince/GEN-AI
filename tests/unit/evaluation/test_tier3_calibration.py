@@ -196,6 +196,47 @@ def test_connector_output_confidences_straddle_selected_threshold() -> None:
     assert allows < tc.DEFAULT_TIER3_CONFIDENCE
 
 
+def test_truncated_violation_json_falls_back_to_strict_regex() -> None:
+    from safety_platform.guardrails.tier3.guard_classifier import (
+        _violation_confidence,
+    )
+
+    assert _violation_confidence('{"violation": false, ') == 0.0
+    assert _violation_confidence('{"violation": true, ') == 1.0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        '{"violation": "yes", ',
+        '{"violation": ',
+        "maybe",
+        '{"violation": falsehood}',
+        'prefix {"violation": false, ',
+    ),
+)
+def test_violation_fallback_rejects_non_boolean_or_invalid(payload: str) -> None:
+    from safety_platform.guardrails.tier3.guard_classifier import (
+        OllamaGuardError,
+        _violation_confidence,
+    )
+
+    with pytest.raises(OllamaGuardError, match="malformed_verdict"):
+        _violation_confidence(payload)
+
+
+def test_reason_first_output_raises_malformed_verdict() -> None:
+    from safety_platform.guardrails.tier3.guard_classifier import (
+        OllamaGuardError,
+        _violation_confidence,
+    )
+
+    with pytest.raises(OllamaGuardError, match="malformed_verdict"):
+        _violation_confidence("{")
+    with pytest.raises(OllamaGuardError, match="malformed_verdict"):
+        _violation_confidence('{"reason": "harm"}')
+
+
 def test_output_direction_context_is_used_for_scoring() -> None:
     context = ExecutionContext(
         "trace",

@@ -21,7 +21,9 @@ from ..config.registry import (
     RoutingMargins,
 )
 from ..guardrails.tier3.guard_classifier import (
+    _ARBITRATION_NUM_PREDICT,
     _ARBITRATION_SYSTEM,
+    _OUTPUT_STOP,
     MULTI_SIGNAL_GATES,
     GuardClassifier,
     OllamaGuardConfig,
@@ -104,8 +106,17 @@ def _judge_digest() -> str:
     )
 
 
-def _tier3_digest() -> str:
-    return _sha256_json({"prompts": [_TIER3_INSTRUCTION, _ARBITRATION_SYSTEM]})
+def _tier3_digest(*, stop: tuple[str, ...] | None = None) -> str:
+    effective_stop = _OUTPUT_STOP if stop is None else stop
+    return _sha256_json(
+        {
+            "prompts": [_TIER3_INSTRUCTION, _ARBITRATION_SYSTEM],
+            "options": {
+                "num_predict": _ARBITRATION_NUM_PREDICT,
+                "stop": list(effective_stop),
+            },
+        }
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -430,18 +441,14 @@ def _load_reusable_baseline(
     if not isinstance(stored_config, dict):
         raise ValueError("reuse run config_json is invalid")
     stored_judge = stored_config.get("judge_digest")
-    stored_tier3 = stored_config.get("tier3_digest")
-    if stored_judge is None or stored_tier3 is None:
+    if stored_judge is None:
         if not force_reuse:
             raise ValueError(
-                "reuse run has no judge/tier3 prompt digest; "
+                "reuse run has no judge prompt digest; "
                 "pass --force-reuse to reuse it"
             )
-    else:
-        if str(stored_judge) != judge_digest:
-            raise ValueError("reuse run judge prompt/options digest does not match")
-        if str(stored_tier3) != tier3_digest:
-            raise ValueError("reuse run tier3 prompt digest does not match")
+    elif str(stored_judge) != judge_digest:
+        raise ValueError("reuse run judge prompt/options digest does not match")
 
     rows = connection.execute(
         """
