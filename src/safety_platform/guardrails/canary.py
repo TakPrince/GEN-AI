@@ -200,11 +200,18 @@ class CanaryDetector:
         return self._partial_min
 
     def coverage_budget(self, canary_id: str) -> int:
-        """Revealed-position budget: the fragment threshold, capped at the secret
-        length so a short secret can never be fully reassembled."""
+        """Revealed-position budget: at most `budget - 1` secret positions are
+        delivered before a block fires, where for secret length `n` the budget
+        is `min(partial_min, n - 1, max(coverage_run + 1, n // 2))`. It never
+        exceeds `n - 1`, so a secret cannot be fully reassembled."""
         if not self._partial_min:
             return 0
-        return min(self._partial_min, self._lengths.get(canary_id, self._partial_min))
+        length = self._lengths.get(canary_id, self._partial_min)
+        return min(
+            self._partial_min,
+            length - 1,
+            max(self._coverage_run + 1, length // 2),
+        )
 
 
 class ConversationTail:

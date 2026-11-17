@@ -44,6 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--reuse-run", metavar="RUN_ID")
     run.add_argument(
+        "--force-reuse",
+        action="store_true",
+        help="reuse a run that predates judge/tier3 prompt digests",
+    )
+    run.add_argument(
         "--speculative-echo",
         action="store_true",
         help="enable speculative context echo probe (fail-closed early refusal)",
@@ -129,6 +134,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             dataset_path=arguments.dataset,
             database_path=arguments.db,
             reuse_run_id=arguments.reuse_run,
+            force_reuse=arguments.force_reuse,
             speculative_echo=arguments.speculative_echo,
             target_model=arguments.target,
             embed_model=arguments.embed,

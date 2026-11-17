@@ -261,6 +261,29 @@ def test_known_gap_paraphrased_disclosure_is_detected() -> None:
     )
 
 
+def test_single_coverage_run_window_does_not_block_on_its_own() -> None:
+    detector = CanaryDetector(
+        {"c": "internal-api-key"}, partial_min_fragment=16, coverage_run=6
+    )
+    tail = ConversationTail(detector)
+    assert detector.coverage("intern")["c"].bit_count() == 6
+    assert tail.blocked_canaries("conv", "intern") == ()
+
+
+def test_six_char_windows_cannot_deliver_more_than_eight_positions() -> None:
+    secret = "0123456789abcdef"
+    detector = CanaryDetector({"c": secret}, partial_min_fragment=16, coverage_run=6)
+    tail = ConversationTail(detector)
+    delivered = 0
+    for start in (0, 5, 10):
+        window = secret[start : start + 6]
+        if tail.blocked_canaries("conv", window):
+            break
+        tail.commit("conv", window)
+        delivered = tail.revealed("conv")["c"].bit_count()
+    assert delivered <= 8
+
+
 def test_short_secret_cannot_be_fully_reassembled_across_turns() -> None:
     # A secret shorter than partial_min still gets a full-length budget:
     # otherwise coverage could never reach the threshold and the whole value

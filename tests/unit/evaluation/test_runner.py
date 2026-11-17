@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 from collections.abc import Sequence
 from pathlib import Path
@@ -131,7 +132,14 @@ def test_run_config_defaults() -> None:
     assert config.per_label == 20
 
 
-def _reuse_database() -> sqlite3.Connection:
+def _reuse_database(config_json: str | None = None) -> sqlite3.Connection:
+    if config_json is None:
+        config_json = json.dumps(
+            {
+                "judge_digest": runner_module._judge_digest(),
+                "tier3_digest": runner_module._tier3_digest(),
+            }
+        )
     connection = sqlite3.connect(":memory:")
     connection.executescript(_SCHEMA)
     connection.execute(
@@ -146,7 +154,7 @@ def _reuse_database() -> sqlite3.Connection:
             "judge",
             "cases.jsonl",
             "digest",
-            "{}",
+            config_json,
         ),
     )
     connection.executemany(
@@ -209,6 +217,8 @@ def test_reuse_baseline_loads_matching_rows() -> None:
             target_model="target",
             judge_model="judge",
             digest="digest",
+            judge_digest=runner_module._judge_digest(),
+            tier3_digest=runner_module._tier3_digest(),
         )
     finally:
         connection.close()
@@ -248,6 +258,8 @@ def test_reuse_baseline_rejects_mismatch(
                 target_model=target_model,
                 judge_model=judge_model,
                 digest=digest,
+                judge_digest=runner_module._judge_digest(),
+                tier3_digest=runner_module._tier3_digest(),
             )
     finally:
         connection.close()
@@ -266,6 +278,8 @@ def test_reuse_baseline_rejects_aborted_run() -> None:
                 target_model="target",
                 judge_model="judge",
                 digest="digest",
+                judge_digest=runner_module._judge_digest(),
+                tier3_digest=runner_module._tier3_digest(),
             )
     finally:
         connection.close()
@@ -282,9 +296,98 @@ def test_reuse_baseline_rejects_unknown_run() -> None:
                 target_model="target",
                 judge_model="judge",
                 digest="digest",
+                judge_digest=runner_module._judge_digest(),
+                tier3_digest=runner_module._tier3_digest(),
             )
     finally:
         connection.close()
+
+
+def test_reuse_baseline_rejects_changed_judge_digest() -> None:
+    connection = _reuse_database(
+        config_json=json.dumps(
+            {
+                "judge_digest": "old-judge",
+                "tier3_digest": runner_module._tier3_digest(),
+            }
+        )
+    )
+    try:
+        with pytest.raises(ValueError, match="judge.*digest"):
+            _load_reusable_baseline(
+                connection,
+                run_id="old-run",
+                test_cases=(case("a1", "attack"),),
+                target_model="target",
+                judge_model="judge",
+                digest="digest",
+                judge_digest=runner_module._judge_digest(),
+                tier3_digest=runner_module._tier3_digest(),
+            )
+    finally:
+        connection.close()
+
+
+def test_reuse_baseline_rejects_changed_tier3_digest() -> None:
+    connection = _reuse_database(
+        config_json=json.dumps(
+            {
+                "judge_digest": runner_module._judge_digest(),
+                "tier3_digest": "old-tier3",
+            }
+        )
+    )
+    try:
+        with pytest.raises(ValueError, match="tier3.*digest"):
+            _load_reusable_baseline(
+                connection,
+                run_id="old-run",
+                test_cases=(case("a1", "attack"),),
+                target_model="target",
+                judge_model="judge",
+                digest="digest",
+                judge_digest=runner_module._judge_digest(),
+                tier3_digest=runner_module._tier3_digest(),
+            )
+    finally:
+        connection.close()
+
+
+def test_reuse_baseline_rejects_missing_digest_without_force() -> None:
+    connection = _reuse_database(config_json="{}")
+    try:
+        with pytest.raises(ValueError, match="no judge/tier3 prompt digest"):
+            _load_reusable_baseline(
+                connection,
+                run_id="old-run",
+                test_cases=(case("a1", "attack"),),
+                target_model="target",
+                judge_model="judge",
+                digest="digest",
+                judge_digest="current-judge",
+                tier3_digest="current-tier3",
+            )
+    finally:
+        connection.close()
+
+
+def test_reuse_baseline_allows_missing_digest_with_force() -> None:
+    connection = _reuse_database(config_json="{}")
+    try:
+        reused = _load_reusable_baseline(
+            connection,
+            run_id="old-run",
+            test_cases=(case("a1", "attack"),),
+            target_model="target",
+            judge_model="judge",
+            digest="digest",
+            judge_digest="current-judge",
+            tier3_digest="current-tier3",
+            force_reuse=True,
+        )
+    finally:
+        connection.close()
+    assert set(reused) == {"a1"}
 
 
 def test_embedding_cache_round_trip(tmp_path: Path) -> None:

@@ -57,11 +57,11 @@ async def test_in_order_split_is_blocked_when_it_reaches_threshold(runtime) -> N
     pieces = ["BIGPICK", "LE_CANA", "RY_2026", "_7F92A1"]
     results = [await session.turn("continue please", piece) for piece in pieces]
 
-    # Each piece alone is below the partial threshold, and so is the first two
-    # together (14 chars): delivered.
-    assert all(_delivered(r) for r in results[:2])
-    # The third piece takes the carried tail to 21 contiguous canary chars: blocked.
-    assert results[2].final_response == REFUSAL_TEXT
+    # Turn 1 covers 7 positions, below the budget of 14: delivered.
+    assert _delivered(results[0])
+    # The second piece pushes cumulative coverage to 14: blocked, as are later turns.
+    assert results[1].final_response == REFUSAL_TEXT
+    assert results[1].blocked is True
     assert results[2].blocked is True
     assert all(CANARY not in (r.final_response or "") for r in results)
 
@@ -81,9 +81,12 @@ async def test_blocked_turn_does_not_poison_later_turns(runtime) -> None:
 async def test_conversations_are_isolated(runtime) -> None:
     first = _Session(runtime, "conv-a")
     second = _Session(runtime, "conv-b")
-    assert _delivered(await first.turn("q", "BIGPICKLE_CANA"))
-    # A's fragment would complete the canary with B's tail if state leaked.
-    assert _delivered(await second.turn("q", "RY_2026_7F92A1"))
+    assert _delivered(await first.turn("q", "BIGPICKLE"))
+    assert _delivered(await second.turn("q", "CANARY_2026"))
+    # Control: the same two fragments in one conversation block the second.
+    control = _Session(runtime, "conv-control")
+    assert _delivered(await control.turn("q", "BIGPICKLE"))
+    assert (await control.turn("q", "CANARY_2026")).blocked is True
 
 
 @pytest.mark.asyncio
@@ -99,13 +102,14 @@ async def test_error_turn_is_not_carried_forward(
         raise RuntimeError("guard unavailable")
 
     monkeypatch.setattr(CascadeRuntime, "run", boom)
-    errored = await session.turn("q", "BIGPICKLE_CANA")
+    errored = await session.turn("q", "BIGPICKLE")
     assert errored.outcome == "error"
     assert errored.blocked is False
 
     monkeypatch.setattr(CascadeRuntime, "run", original)
     # The errored output was never delivered, so it must not join the tail.
-    assert _delivered(await session.turn("q", "RY_2026_7F92A1"))
+    # These fragments would block if the errored text had been carried forward.
+    assert _delivered(await session.turn("q", "CANARY_2026"))
 
 
 @pytest.mark.asyncio

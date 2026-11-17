@@ -21,14 +21,21 @@ from ..config.registry import (
     RoutingMargins,
 )
 from ..guardrails.tier3.guard_classifier import (
+    _ARBITRATION_SYSTEM,
     MULTI_SIGNAL_GATES,
     GuardClassifier,
     OllamaGuardConfig,
     OllamaLlamaGuardConnector,
 )
+from ..guardrails.tier3.guard_classifier import (
+    _INSTRUCTION as _TIER3_INSTRUCTION,
+)
 from .cascade import CascadeOutcome, build_cascade, make_context
 from .dataset import EvaluationCase, dataset_digest, load_cases
 from .llm import (
+    _CONVERSATION_JUDGE_INSTRUCTION,
+    _JUDGE_INSTRUCTION,
+    _JUDGE_NUM_PREDICT,
     ComplianceJudge,
     JudgeResult,
     OllamaClient,
@@ -83,11 +90,30 @@ CREATE TABLE IF NOT EXISTS embedding_cache (
 """
 
 
+def _sha256_json(value: object) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _judge_digest() -> str:
+    return _sha256_json(
+        {
+            "prompts": [_JUDGE_INSTRUCTION, _CONVERSATION_JUDGE_INSTRUCTION],
+            "options": {"temperature": 0, "num_predict": _JUDGE_NUM_PREDICT},
+        }
+    )
+
+
+def _tier3_digest() -> str:
+    return _sha256_json({"prompts": [_TIER3_INSTRUCTION, _ARBITRATION_SYSTEM]})
+
+
 @dataclass(frozen=True, slots=True)
 class RunConfig:
     dataset_path: Path
     database_path: Path
     reuse_run_id: str | None = None
+    force_reuse: bool = False
     target_model: str = "llama3.2:latest"
     embed_model: str = "llama3.2:latest"
     tier3_model: str = "qwen3:8b"
@@ -139,6 +165,8 @@ async def run_evaluation(config: RunConfig) -> str:
     try:
         connection.executescript(_SCHEMA)
         embedder.seed(_load_embedding_cache(connection, config.embed_model))
+        judge_digest = _judge_digest()
+        tier3_digest = _tier3_digest()
         reused: dict[str, tuple[_GeneratedCase, JudgeResult]] = (
             _load_reusable_baseline(
                 connection,
@@ -147,6 +175,9 @@ async def run_evaluation(config: RunConfig) -> str:
                 target_model=config.target_model,
                 judge_model=config.judge_model,
                 digest=digest_value,
+                judge_digest=judge_digest,
+                tier3_digest=tier3_digest,
+                force_reuse=config.force_reuse,
             )
             if config.reuse_run_id is not None
             else {}
@@ -175,6 +206,8 @@ async def run_evaluation(config: RunConfig) -> str:
                         "tier2_floor": config.tier2_floor,
                         "tier2_gap": config.tier2_gap,
                         "tier3_confidence": config.tier3_confidence,
+                        "judge_digest": judge_digest,
+                        "tier3_digest": tier3_digest,
                     },
                     sort_keys=True,
                 ),
@@ -370,10 +403,13 @@ def _load_reusable_baseline(
     target_model: str,
     judge_model: str,
     digest: str,
+    judge_digest: str,
+    tier3_digest: str,
+    force_reuse: bool = False,
 ) -> dict[str, tuple[_GeneratedCase, JudgeResult]]:
     meta = connection.execute(
-        "SELECT target_model, judge_model, dataset_digest, completed_ns "
-        "FROM run WHERE run_id = ?",
+        "SELECT target_model, judge_model, dataset_digest, completed_ns, "
+        "config_json FROM run WHERE run_id = ?",
         (run_id,),
     ).fetchone()
     if meta is None:
@@ -386,6 +422,26 @@ def _load_reusable_baseline(
         raise ValueError("reuse run dataset digest does not match")
     if meta[3] is None:
         raise ValueError("reuse run is not completed")
+
+    try:
+        stored_config = json.loads(str(meta[4]))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("reuse run config_json is invalid") from exc
+    if not isinstance(stored_config, dict):
+        raise ValueError("reuse run config_json is invalid")
+    stored_judge = stored_config.get("judge_digest")
+    stored_tier3 = stored_config.get("tier3_digest")
+    if stored_judge is None or stored_tier3 is None:
+        if not force_reuse:
+            raise ValueError(
+                "reuse run has no judge/tier3 prompt digest; "
+                "pass --force-reuse to reuse it"
+            )
+    else:
+        if str(stored_judge) != judge_digest:
+            raise ValueError("reuse run judge prompt/options digest does not match")
+        if str(stored_tier3) != tier3_digest:
+            raise ValueError("reuse run tier3 prompt digest does not match")
 
     rows = connection.execute(
         """
